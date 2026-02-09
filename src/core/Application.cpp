@@ -89,9 +89,15 @@ void Application::Shutdown()
     SaveRecents();
     SaveAlbumFolders();
 
-    // Wait for persistent thumbnail save to finish
+    // Wait for any in-flight persistent thumbnail save
     if (thumbSaveThread_.joinable()) {
         thumbSaveThread_.join();
+    }
+
+    // Final save of persistent thumbnail cache (captures thumbnails decoded since last scan)
+    if (pipeline_) {
+        auto thumbPath = GetScanCachePath().parent_path() / L"scan_thumbs.bin";
+        pipeline_->SavePersistentThumbs(thumbPath);
     }
 
     // Cancel any ongoing scan

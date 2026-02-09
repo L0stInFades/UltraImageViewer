@@ -570,7 +570,7 @@ static void RenderImageGrid(
 
     // Prefetch buffer: pre-decode 1.5 screens above and below the viewport
     // so thumbnails are ready before the user scrolls to them.
-    float prefetchMargin = contentHeight * 1.5f;
+    float prefetchMargin = contentHeight * Theme::PrefetchScreens;
 
     for (size_t s = 0; s < sections.size(); ++s) {
         const auto& section = sections[s];

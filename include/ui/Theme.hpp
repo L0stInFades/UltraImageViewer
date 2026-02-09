@@ -78,10 +78,12 @@ namespace Theme {
 
     // Performance tuning
     constexpr float FastScrollThreshold = 2000.0f;      // px/sec scroll velocity to trigger fast-scroll mode
-    constexpr int MaxBitmapsPerFrame = 24;               // max GPU uploads (D2D bitmap creation) per frame
+    constexpr int MaxBitmapsPerFrame = 64;               // max GPU uploads (D2D bitmap creation) per frame
+    constexpr int PersistSyncBudgetPerFrame = 200;       // max synchronous disk→GPU loads per frame
     constexpr int ThumbnailWorkerThreads = 4;            // background decode threads
     constexpr size_t ThumbnailCacheMaxBytes = 1024ULL * 1024 * 1024;  // 1GB LRU eviction threshold
     constexpr uint32_t ThumbnailMaxPx = 160;                         // max thumbnail decode resolution (px)
+    constexpr float PrefetchScreens = 3.0f;              // prefetch N screens above/below viewport
 
 } // namespace Theme
 } // namespace UI

@@ -404,12 +404,46 @@ std::vector<ScannedImage> ImagePipeline::ScanSystemImages(
 Microsoft::WRL::ComPtr<ID2D1Bitmap> ImagePipeline::GetCachedThumbnail(
     const std::filesystem::path& path)
 {
-    std::lock_guard lock(cacheMutex_);
-    auto it = thumbnailCache_.find(path);
-    if (it != thumbnailCache_.end()) {
-        it->second.lastAccess = std::chrono::steady_clock::now();
-        return it->second.bitmap;
+    // Check GPU cache first
+    {
+        std::lock_guard lock(cacheMutex_);
+        auto it = thumbnailCache_.find(path);
+        if (it != thumbnailCache_.end()) {
+            it->second.lastAccess = std::chrono::steady_clock::now();
+            return it->second.bitmap;
+        }
     }
+
+    // Fall through to persistent disk cache (even during fast scroll)
+    if (persistSyncBudget_ > 0 && renderer_) {
+        uint16_t w = 0, h = 0;
+        const uint8_t* pixelPtr = nullptr;
+        {
+            std::shared_lock plock(persistMutex_);
+            auto it = persistIndex_.find(path);
+            if (it != persistIndex_.end()) {
+                w = it->second.width;
+                h = it->second.height;
+                pixelPtr = it->second.pixelData;
+            }
+        }
+        if (pixelPtr && w > 0 && h > 0) {
+            auto bitmap = renderer_->CreateBitmap(w, h, pixelPtr);
+            if (bitmap) {
+                --persistSyncBudget_;
+                std::lock_guard lock(cacheMutex_);
+                ThumbnailCacheEntry entry;
+                entry.bitmap = bitmap;
+                entry.width = w;
+                entry.height = h;
+                entry.lastAccess = std::chrono::steady_clock::now();
+                thumbnailCacheBytes_ += static_cast<size_t>(w) * h * 4;
+                thumbnailCache_[path] = std::move(entry);
+                return bitmap;
+            }
+        }
+    }
+
     return nullptr;
 }
 
@@ -592,7 +626,7 @@ Microsoft::WRL::ComPtr<ID2D1Bitmap> ImagePipeline::RequestThumbnail(
 int ImagePipeline::FlushReadyThumbnails(int maxCount)
 {
     // Reset per-frame budget for synchronous persistent cache loads
-    persistSyncBudget_ = 60;
+    persistSyncBudget_ = UI::Theme::PersistSyncBudgetPerFrame;
 
     std::vector<ReadyThumbnail> batch;
     {
