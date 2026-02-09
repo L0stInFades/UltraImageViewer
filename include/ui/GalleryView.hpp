@@ -216,6 +216,10 @@ private:
     Microsoft::WRL::ComPtr<IDWriteTextFormat> albumCountFormat_;
     Microsoft::WRL::ComPtr<IDWriteTextFormat> backButtonFormat_;
 
+    // Fast-scroll detection
+    float scrollVelocitySmoothed_ = 0.0f;
+    bool isFastScrolling_ = false;
+
     // Mouse hover
     float hoverX_ = -1.0f;
     float hoverY_ = -1.0f;

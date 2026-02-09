@@ -1,4 +1,5 @@
 #include "core/ImagePipeline.hpp"
+#include "ui/Theme.hpp"
 #include <algorithm>
 #include <set>
 #include <unordered_set>
@@ -25,20 +26,43 @@ void ImagePipeline::Initialize(ImageDecoder* decoder, CacheManager* cache,
 
     shutdownRequested_ = false;
     loadThread_ = std::jthread([this](std::stop_token) { LoadThreadFunc(); });
+
+    // Launch thumbnail decode worker threads
+    for (int i = 0; i < UI::Theme::ThumbnailWorkerThreads; ++i) {
+        thumbnailWorkers_.emplace_back(
+            std::jthread([this](std::stop_token) { ThumbnailWorkerFunc(); }));
+    }
 }
 
 void ImagePipeline::Shutdown()
 {
     shutdownRequested_ = true;
     queueCV_.notify_all();
+    requestCV_.notify_all();
 
     if (loadThread_.joinable()) {
         loadThread_.request_stop();
         loadThread_.join();
     }
 
+    for (auto& worker : thumbnailWorkers_) {
+        if (worker.joinable()) {
+            worker.request_stop();
+            worker.join();
+        }
+    }
+    thumbnailWorkers_.clear();
+
+    ClosePersistentMapping();
+
+    {
+        std::lock_guard lock(thumbSaveMutex_);
+        thumbSaveBuffer_.clear();
+    }
+
     std::lock_guard lock(cacheMutex_);
     thumbnailCache_.clear();
+    thumbnailCacheBytes_ = 0;
     fullImageCache_.clear();
 }
 
@@ -91,14 +115,22 @@ Microsoft::WRL::ComPtr<ID2D1Bitmap> ImagePipeline::GetThumbnail(const std::files
         std::lock_guard lock(cacheMutex_);
         auto it = thumbnailCache_.find(path);
         if (it != thumbnailCache_.end()) {
-            return it->second;
+            it->second.lastAccess = std::chrono::steady_clock::now();
+            return it->second.bitmap;
         }
     }
 
     auto bitmap = DecodeAndCreateThumbnail(path, maxSize);
     if (bitmap) {
+        auto bmpSize = bitmap->GetPixelSize();
         std::lock_guard lock(cacheMutex_);
-        thumbnailCache_[path] = bitmap;
+        ThumbnailCacheEntry entry;
+        entry.bitmap = bitmap;
+        entry.width = bmpSize.width;
+        entry.height = bmpSize.height;
+        entry.lastAccess = std::chrono::steady_clock::now();
+        thumbnailCacheBytes_ += static_cast<size_t>(bmpSize.width) * bmpSize.height * 4;
+        thumbnailCache_[path] = std::move(entry);
     }
     return bitmap;
 }
@@ -369,10 +401,23 @@ std::vector<ScannedImage> ImagePipeline::ScanSystemImages(
     return ScanFolders(folders, cancelFlag, outCount, nullptr);
 }
 
+Microsoft::WRL::ComPtr<ID2D1Bitmap> ImagePipeline::GetCachedThumbnail(
+    const std::filesystem::path& path)
+{
+    std::lock_guard lock(cacheMutex_);
+    auto it = thumbnailCache_.find(path);
+    if (it != thumbnailCache_.end()) {
+        it->second.lastAccess = std::chrono::steady_clock::now();
+        return it->second.bitmap;
+    }
+    return nullptr;
+}
+
 bool ImagePipeline::HasThumbnail(const std::filesystem::path& path) const
 {
     std::lock_guard lock(cacheMutex_);
-    return thumbnailCache_.contains(path);
+    auto it = thumbnailCache_.find(path);
+    return it != thumbnailCache_.end() && it->second.bitmap;
 }
 
 bool ImagePipeline::HasFullImage(const std::filesystem::path& path) const
@@ -434,8 +479,15 @@ void ImagePipeline::LoadThreadFunc()
         if (req.isThumbnail) {
             bitmap = DecodeAndCreateThumbnail(req.path, req.maxSize);
             if (bitmap) {
+                auto bmpSize = bitmap->GetPixelSize();
                 std::lock_guard lock(cacheMutex_);
-                thumbnailCache_[req.path] = bitmap;
+                ThumbnailCacheEntry entry;
+                entry.bitmap = bitmap;
+                entry.width = bmpSize.width;
+                entry.height = bmpSize.height;
+                entry.lastAccess = std::chrono::steady_clock::now();
+                thumbnailCacheBytes_ += static_cast<size_t>(bmpSize.width) * bmpSize.height * 4;
+                thumbnailCache_[req.path] = std::move(entry);
             }
         } else {
             bitmap = DecodeAndCreateBitmap(req.path);
@@ -449,6 +501,495 @@ void ImagePipeline::LoadThreadFunc()
             req.callback(bitmap);
         }
     }
+}
+
+// --- Async Thumbnail Pipeline Implementation ---
+
+Microsoft::WRL::ComPtr<ID2D1Bitmap> ImagePipeline::RequestThumbnail(
+    const std::filesystem::path& path, uint32_t targetSize)
+{
+    // Check in-memory cache first (fast path)
+    {
+        std::lock_guard lock(cacheMutex_);
+        auto it = thumbnailCache_.find(path);
+        if (it != thumbnailCache_.end()) {
+            it->second.lastAccess = std::chrono::steady_clock::now();
+            return it->second.bitmap;
+        }
+    }
+
+    // Synchronous path: create D2D bitmap directly from persistent cache
+    // on the render thread. Zero-frame latency — identical to iOS behavior.
+    if (persistSyncBudget_ > 0 && renderer_) {
+        uint16_t w = 0, h = 0;
+        const uint8_t* pixelPtr = nullptr;
+
+        {
+            std::shared_lock plock(persistMutex_);
+            auto it = persistIndex_.find(path);
+            if (it != persistIndex_.end()) {
+                w = it->second.width;
+                h = it->second.height;
+                pixelPtr = it->second.pixelData;
+            }
+        }
+
+        if (pixelPtr && w > 0 && h > 0) {
+            auto bitmap = renderer_->CreateBitmap(w, h, pixelPtr);
+            if (bitmap) {
+                --persistSyncBudget_;
+                std::lock_guard lock(cacheMutex_);
+                ThumbnailCacheEntry entry;
+                entry.bitmap = bitmap;
+                entry.width = w;
+                entry.height = h;
+                entry.lastAccess = std::chrono::steady_clock::now();
+                thumbnailCacheBytes_ += static_cast<size_t>(w) * h * 4;
+                thumbnailCache_[path] = std::move(entry);
+                return bitmap;
+            }
+        }
+    }
+
+    // Queue a decode request if not already pending
+    {
+        std::lock_guard lock(requestMutex_);
+        uint64_t gen = generation_.load();
+
+        auto pendIt = pendingRequests_.find(path);
+        if (pendIt != pendingRequests_.end() && pendIt->second == gen) {
+            // Already have a current-generation request pending
+            return nullptr;
+        }
+
+        // Check if this path is visible for priority
+        bool isVis = false;
+        {
+            std::lock_guard vlock(visibleMutex_);
+            isVis = visiblePaths_.contains(path);
+        }
+
+        ThumbnailRequest req;
+        req.path = path;
+        req.targetSize = targetSize;
+        req.generation = gen;
+        req.isVisible = isVis;
+
+        // Visible items go to the front, non-visible go to the back
+        if (isVis) {
+            requestDeque_.push_front(std::move(req));
+        } else {
+            requestDeque_.push_back(std::move(req));
+        }
+
+        pendingRequests_[path] = gen;
+    }
+    requestCV_.notify_one();
+
+    return nullptr;  // Not ready yet
+}
+
+int ImagePipeline::FlushReadyThumbnails(int maxCount)
+{
+    // Reset per-frame budget for synchronous persistent cache loads
+    persistSyncBudget_ = 60;
+
+    std::vector<ReadyThumbnail> batch;
+    {
+        std::lock_guard lock(readyMutex_);
+        int count = std::min(maxCount, static_cast<int>(readyQueue_.size()));
+        if (count == 0) return 0;
+
+        batch.reserve(count);
+        for (int i = 0; i < count; ++i) {
+            batch.push_back(std::move(readyQueue_[i]));
+        }
+        readyQueue_.erase(readyQueue_.begin(), readyQueue_.begin() + count);
+    }
+
+    int created = 0;
+    for (auto& ready : batch) {
+        if (!renderer_ || !ready.pixels || ready.width == 0 || ready.height == 0) continue;
+
+        // Create D2D bitmap (copies pixels to GPU internally)
+        auto bitmap = renderer_->CreateBitmap(ready.width, ready.height, ready.pixels.get());
+        if (bitmap) {
+            // Save raw pixels for persistent cache AFTER GPU copy, BEFORE moving
+            {
+                std::lock_guard lock(thumbSaveMutex_);
+                if (!thumbSaveBuffer_.contains(ready.path)) {
+                    ThumbSaveEntry save;
+                    save.width = static_cast<uint16_t>(ready.width);
+                    save.height = static_cast<uint16_t>(ready.height);
+                    save.pixelSize = ready.width * ready.height * 4;
+                    save.pixels = std::move(ready.pixels);  // zero-copy transfer
+                    thumbSaveBuffer_[ready.path] = std::move(save);
+                }
+            }
+
+            std::lock_guard lock(cacheMutex_);
+            ThumbnailCacheEntry entry;
+            entry.bitmap = bitmap;
+            entry.width = ready.width;
+            entry.height = ready.height;
+            entry.lastAccess = std::chrono::steady_clock::now();
+            thumbnailCacheBytes_ += static_cast<size_t>(ready.width) * ready.height * 4;
+            thumbnailCache_[ready.path] = std::move(entry);
+            ++created;
+        }
+    }
+
+    // Evict if over budget
+    if (created > 0) {
+        EvictThumbnailsIfNeeded();
+    }
+
+    return created;
+}
+
+void ImagePipeline::InvalidateRequests()
+{
+    generation_.fetch_add(1);
+
+    std::lock_guard lock(requestMutex_);
+    // Remove non-visible requests (visible ones are kept since they're still needed)
+    std::erase_if(requestDeque_, [](const ThumbnailRequest& r) { return !r.isVisible; });
+    // Clear pending tracking so new requests can be queued
+    pendingRequests_.clear();
+}
+
+void ImagePipeline::SetVisibleRange(const std::vector<std::filesystem::path>& paths)
+{
+    std::lock_guard lock(visibleMutex_);
+    visiblePaths_.clear();
+    for (const auto& p : paths) {
+        visiblePaths_[p] = true;
+    }
+}
+
+bool ImagePipeline::HasPendingThumbnails() const
+{
+    std::lock_guard lock(readyMutex_);
+    return !readyQueue_.empty();
+}
+
+void ImagePipeline::ThumbnailWorkerFunc()
+{
+    while (!shutdownRequested_) {
+        ThumbnailRequest req;
+        {
+            std::unique_lock lock(requestMutex_);
+            requestCV_.wait(lock, [this] {
+                return !requestDeque_.empty() || shutdownRequested_;
+            });
+
+            if (shutdownRequested_) break;
+            if (requestDeque_.empty()) continue;
+
+            req = std::move(requestDeque_.front());
+            requestDeque_.pop_front();
+        }
+
+        // Check generation — skip stale requests
+        if (req.generation < generation_.load()) continue;
+
+        // Check if already cached (another worker may have finished it)
+        {
+            std::lock_guard lock(cacheMutex_);
+            if (thumbnailCache_.contains(req.path)) continue;
+        }
+
+        // Try persistent thumbnail cache first (memcpy vs JPEG decode = 100x faster)
+        std::unique_ptr<uint8_t[]> pixels;
+        uint32_t imgWidth = 0, imgHeight = 0;
+
+        {
+            std::shared_lock plock(persistMutex_);
+            auto it = persistIndex_.find(req.path);
+            if (it != persistIndex_.end()) {
+                imgWidth = it->second.width;
+                imgHeight = it->second.height;
+                uint32_t pixelSize = imgWidth * imgHeight * 4;
+                pixels = std::make_unique<uint8_t[]>(pixelSize);
+                memcpy(pixels.get(), it->second.pixelData, pixelSize);
+            }
+        }
+
+        // Fall back to JPEG decode if not in persistent cache
+        if (!pixels) {
+            if (!decoder_) continue;
+
+            auto image = decoder_->GenerateThumbnail(req.path, req.targetSize);
+            if (!image || !image->data) {
+                image = decoder_->Decode(req.path, DecoderFlags::SIMD);
+            }
+            if (!image || !image->data) continue;
+
+            pixels = std::move(image->data);
+            imgWidth = image->info.width;
+            imgHeight = image->info.height;
+        }
+
+        // Check generation again after decode
+        if (req.generation < generation_.load()) continue;
+
+        // Push to ready queue for render thread to create D2D bitmap
+        ReadyThumbnail ready;
+        ready.path = req.path;
+        ready.pixels = std::move(pixels);
+        ready.width = imgWidth;
+        ready.height = imgHeight;
+
+        {
+            std::lock_guard lock(readyMutex_);
+            readyQueue_.push_back(std::move(ready));
+        }
+    }
+}
+
+void ImagePipeline::EvictThumbnailsIfNeeded()
+{
+    std::lock_guard lock(cacheMutex_);
+
+    if (thumbnailCacheBytes_ <= UI::Theme::ThumbnailCacheMaxBytes) return;
+
+    // Snapshot visible paths so we never evict on-screen thumbnails
+    std::unordered_map<std::filesystem::path, bool> visSnap;
+    {
+        std::lock_guard vlock(visibleMutex_);
+        visSnap = visiblePaths_;
+    }
+
+    // Build a list sorted by last access time (oldest first)
+    struct EvictCandidate {
+        std::filesystem::path path;
+        std::chrono::steady_clock::time_point lastAccess;
+        size_t bytes;
+    };
+
+    std::vector<EvictCandidate> candidates;
+    candidates.reserve(thumbnailCache_.size());
+    for (const auto& [path, entry] : thumbnailCache_) {
+        // Never evict visible thumbnails
+        if (visSnap.contains(path)) continue;
+        size_t bytes = static_cast<size_t>(entry.width) * entry.height * 4;
+        candidates.push_back({path, entry.lastAccess, bytes});
+    }
+
+    std::sort(candidates.begin(), candidates.end(),
+        [](const EvictCandidate& a, const EvictCandidate& b) {
+            return a.lastAccess < b.lastAccess;
+        });
+
+    // Evict to 75% of budget to avoid thrashing (constant evict-refill cycles)
+    size_t targetBytes = UI::Theme::ThumbnailCacheMaxBytes * 3 / 4;
+    for (const auto& c : candidates) {
+        if (thumbnailCacheBytes_ <= targetBytes) break;
+
+        thumbnailCache_.erase(c.path);
+        if (thumbnailCacheBytes_ >= c.bytes) {
+            thumbnailCacheBytes_ -= c.bytes;
+        } else {
+            thumbnailCacheBytes_ = 0;
+        }
+    }
+}
+
+// --- Persistent thumbnail cache (memory-mapped binary file) ---
+//
+// File format: sequential variable-size entries
+//   Header (32 bytes): "UIVT" + version(4) + entry_count(4) + reserved(20)
+//   Per entry: path_len(2) + width(2) + height(2) + reserved(2) + path(wchar_t[]) + pixels(BGRA[])
+
+void ImagePipeline::ClosePersistentMapping()
+{
+    std::unique_lock plock(persistMutex_);
+    persistIndex_.clear();
+
+    if (persistData_) {
+        UnmapViewOfFile(persistData_);
+        persistData_ = nullptr;
+    }
+    if (persistMapH_) {
+        CloseHandle(static_cast<HANDLE>(persistMapH_));
+        persistMapH_ = nullptr;
+    }
+    if (persistFileH_) {
+        CloseHandle(static_cast<HANDLE>(persistFileH_));
+        persistFileH_ = nullptr;
+    }
+    persistSize_ = 0;
+}
+
+void ImagePipeline::LoadPersistentThumbs(const std::filesystem::path& cachePath)
+{
+    std::error_code ec;
+    if (!std::filesystem::exists(cachePath, ec)) return;
+
+    HANDLE hFile = CreateFileW(cachePath.c_str(), GENERIC_READ, FILE_SHARE_READ,
+                               nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (hFile == INVALID_HANDLE_VALUE) return;
+
+    LARGE_INTEGER fileSize;
+    if (!GetFileSizeEx(hFile, &fileSize) || fileSize.QuadPart < 32) {
+        CloseHandle(hFile);
+        return;
+    }
+
+    HANDLE hMapping = CreateFileMappingW(hFile, nullptr, PAGE_READONLY, 0, 0, nullptr);
+    if (!hMapping) {
+        CloseHandle(hFile);
+        return;
+    }
+
+    const uint8_t* data = static_cast<const uint8_t*>(
+        MapViewOfFile(hMapping, FILE_MAP_READ, 0, 0, 0));
+    if (!data) {
+        CloseHandle(hMapping);
+        CloseHandle(hFile);
+        return;
+    }
+
+    size_t size = static_cast<size_t>(fileSize.QuadPart);
+
+    // Validate header
+    if (memcmp(data, "UIVT", 4) != 0) {
+        UnmapViewOfFile(data);
+        CloseHandle(hMapping);
+        CloseHandle(hFile);
+        return;
+    }
+
+    uint32_t version, entryCount;
+    memcpy(&version, data + 4, 4);
+    memcpy(&entryCount, data + 8, 4);
+    if (version != 1) {
+        UnmapViewOfFile(data);
+        CloseHandle(hMapping);
+        CloseHandle(hFile);
+        return;
+    }
+
+    // Parse sequential entries and build index
+    std::unique_lock plock(persistMutex_);
+
+    size_t offset = 32;
+    for (uint32_t i = 0; i < entryCount; ++i) {
+        if (offset + 8 > size) break;
+
+        uint16_t pathLen, w, h, reserved;
+        memcpy(&pathLen, data + offset, 2);
+        memcpy(&w, data + offset + 2, 2);
+        memcpy(&h, data + offset + 4, 2);
+        memcpy(&reserved, data + offset + 6, 2);
+        offset += 8;
+
+        size_t pathBytes = static_cast<size_t>(pathLen) * sizeof(wchar_t);
+        if (offset + pathBytes > size) break;
+
+        const wchar_t* pathChars = reinterpret_cast<const wchar_t*>(data + offset);
+        std::filesystem::path path(std::wstring(pathChars, pathLen));
+        offset += pathBytes;
+
+        uint32_t pixelSize = static_cast<uint32_t>(w) * h * 4;
+        if (offset + pixelSize > size) break;
+
+        PersistThumbInfo info;
+        info.pixelData = data + offset;
+        info.width = w;
+        info.height = h;
+        persistIndex_[std::move(path)] = info;
+
+        offset += pixelSize;
+    }
+
+    persistFileH_ = hFile;
+    persistMapH_ = hMapping;
+    persistData_ = data;
+    persistSize_ = size;
+
+    OutputDebugStringA(("Loaded persistent thumb cache: " +
+        std::to_string(persistIndex_.size()) + " entries\n").c_str());
+}
+
+void ImagePipeline::SavePersistentThumbs(const std::filesystem::path& cachePath)
+{
+    // Snapshot the save buffer (newly decoded this session)
+    std::unordered_map<std::filesystem::path, ThumbSaveEntry> saveBuffer;
+    {
+        std::lock_guard lock(thumbSaveMutex_);
+        saveBuffer = std::move(thumbSaveBuffer_);
+        thumbSaveBuffer_.clear();
+    }
+
+    // Collect old persistent entries not already in save buffer
+    struct OldEntry {
+        std::filesystem::path path;
+        PersistThumbInfo info;
+    };
+    std::vector<OldEntry> oldEntries;
+    {
+        std::shared_lock plock(persistMutex_);
+        for (const auto& [path, info] : persistIndex_) {
+            if (!saveBuffer.contains(path)) {
+                oldEntries.push_back({path, info});
+            }
+        }
+    }
+
+    uint32_t totalEntries = static_cast<uint32_t>(saveBuffer.size() + oldEntries.size());
+    if (totalEntries == 0) return;
+
+    // Write to .tmp file
+    auto tmpPath = cachePath.wstring() + L".tmp";
+
+    FILE* f = _wfopen(tmpPath.c_str(), L"wb");
+    if (!f) return;
+
+    // Header
+    uint8_t header[32] = {};
+    memcpy(header, "UIVT", 4);
+    uint32_t version = 1;
+    memcpy(header + 4, &version, 4);
+    memcpy(header + 8, &totalEntries, 4);
+    fwrite(header, 1, 32, f);
+
+    // Helper: write one entry
+    auto writeEntry = [&](const std::filesystem::path& path, uint16_t w, uint16_t h,
+                          const uint8_t* pixels) {
+        std::wstring pathStr = path.wstring();
+        uint16_t pathLen = static_cast<uint16_t>(pathStr.size());
+        uint16_t reserved = 0;
+        fwrite(&pathLen, 2, 1, f);
+        fwrite(&w, 2, 1, f);
+        fwrite(&h, 2, 1, f);
+        fwrite(&reserved, 2, 1, f);
+        fwrite(pathStr.data(), sizeof(wchar_t), pathLen, f);
+        fwrite(pixels, 1, static_cast<size_t>(w) * h * 4, f);
+    };
+
+    // Write new/updated entries from save buffer
+    for (const auto& [path, entry] : saveBuffer) {
+        if (entry.pixels) {
+            writeEntry(path, entry.width, entry.height, entry.pixels.get());
+        }
+    }
+
+    // Write old entries (still valid, from previous persistent cache)
+    for (const auto& old : oldEntries) {
+        writeEntry(old.path, old.info.width, old.info.height, old.info.pixelData);
+    }
+
+    fclose(f);
+
+    // Close old memory mapping (releases file handles)
+    ClosePersistentMapping();
+
+    // Atomically replace old cache file
+    MoveFileExW(tmpPath.c_str(), cachePath.c_str(), MOVEFILE_REPLACE_EXISTING);
+
+    OutputDebugStringA(("Saved persistent thumb cache: " +
+        std::to_string(totalEntries) + " entries\n").c_str());
 }
 
 } // namespace Core

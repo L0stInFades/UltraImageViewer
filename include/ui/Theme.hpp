@@ -60,6 +60,13 @@ namespace Theme {
     constexpr float NavigationStiffness = 400.0f;
     constexpr float NavigationDamping = 32.0f;
 
+    // Performance tuning
+    constexpr float FastScrollThreshold = 2000.0f;      // px/sec scroll velocity to trigger fast-scroll mode
+    constexpr int MaxBitmapsPerFrame = 24;               // max GPU uploads (D2D bitmap creation) per frame
+    constexpr int ThumbnailWorkerThreads = 4;            // background decode threads
+    constexpr size_t ThumbnailCacheMaxBytes = 1024ULL * 1024 * 1024;  // 1GB LRU eviction threshold
+    constexpr uint32_t ThumbnailMaxPx = 160;                         // max thumbnail decode resolution (px)
+
 } // namespace Theme
 } // namespace UI
 } // namespace UltraImageViewer

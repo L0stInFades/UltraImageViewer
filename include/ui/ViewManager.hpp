@@ -43,6 +43,8 @@ public:
     void OnMouseDown(float x, float y);
     void OnMouseMove(float x, float y);
     void OnMouseUp(float x, float y);
+    void OnMiddleMouseDown(float x, float y);
+    void OnMiddleMouseUp(float x, float y);
     void OnGesture(const GestureEventArgs& args);
 
     // View size

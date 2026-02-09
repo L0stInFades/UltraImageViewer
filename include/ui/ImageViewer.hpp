@@ -38,6 +38,8 @@ public:
     void OnMouseMove(float x, float y);
     void OnMouseUp(float x, float y);
     void OnMouseWheel(float delta, float x, float y);
+    void OnMiddleMouseDown(float x, float y);
+    void OnMiddleMouseUp(float x, float y);
     void OnKeyDown(UINT key);
 
     // Get current image rect (for hero transition return)
@@ -101,6 +103,7 @@ private:
     Animation::SpringAnimation dismissSpring_;
 
     // Interaction state
+    bool isMiddleDragging_ = false;
     bool isMouseDown_ = false;
     float mouseDownX_ = 0.0f;
     float mouseDownY_ = 0.0f;

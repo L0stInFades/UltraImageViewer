@@ -256,6 +256,22 @@ void ViewManager::OnMouseUp(float x, float y)
     needsRender_ = true;
 }
 
+void ViewManager::OnMiddleMouseDown(float x, float y)
+{
+    if (state_ == ViewState::Viewer) {
+        imageViewer_.OnMiddleMouseDown(x, y);
+    }
+    needsRender_ = true;
+}
+
+void ViewManager::OnMiddleMouseUp(float x, float y)
+{
+    if (state_ == ViewState::Viewer) {
+        imageViewer_.OnMiddleMouseUp(x, y);
+    }
+    needsRender_ = true;
+}
+
 void ViewManager::OnGesture(const GestureEventArgs& args)
 {
     // Route gesture events based on type

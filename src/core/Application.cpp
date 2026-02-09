@@ -12,7 +12,6 @@
 #include <shobjidl.h>
 #include <knownfolders.h>
 #include <fstream>
-#include <sstream>
 #include <set>
 #include <wrl/client.h>
 
@@ -90,6 +89,11 @@ void Application::Shutdown()
     SaveRecents();
     SaveAlbumFolders();
 
+    // Wait for persistent thumbnail save to finish
+    if (thumbSaveThread_.joinable()) {
+        thumbSaveThread_.join();
+    }
+
     // Cancel any ongoing scan
     scanCancelled_ = true;
     if (scanThread_.joinable()) {
@@ -133,6 +137,30 @@ int Application::Run(int nCmdShow)
     // Auto-scan: merge album folders + system defaults, progressive display
     if (currentImages_.empty()) {
         LoadAlbumFolders();
+
+        // Load persistent thumbnail cache (memory-mapped for instant pixel access)
+        if (pipeline_) {
+            auto thumbPath = GetScanCachePath().parent_path() / L"scan_thumbs.bin";
+            pipeline_->LoadPersistentThumbs(thumbPath);
+        }
+
+        // Load cached scan results for instant display
+        auto cached = LoadScanCache();
+        if (!cached.empty()) {
+            DebugLog(("Loaded " + std::to_string(cached.size()) + " cached images").c_str());
+            if (viewManager_) {
+                viewManager_->GetGalleryView()->SetImagesGrouped(cached);
+            }
+            currentImages_.clear();
+            for (const auto& img : cached) {
+                currentImages_.push_back(img.path);
+            }
+            std::wstring title = windowTitle_ + L" - " +
+                std::to_wstring(cached.size()) + L" photos";
+            SetWindowTextW(hwnd_, title.c_str());
+        }
+
+        // Start background rescan (will replace cached data when done)
         StartFullScan();
     }
 
@@ -293,6 +321,16 @@ void Application::CheckScanProgress()
         // Only close scanning state when scan is actually finished
         if (!isScanning_) {
             gallery->SetScanningState(false, results.size());
+            SaveScanCache(results);  // Persist paths for next launch
+
+            // Save persistent thumbnail cache in background thread
+            if (pipeline_) {
+                auto thumbPath = GetScanCachePath().parent_path() / L"scan_thumbs.bin";
+                if (thumbSaveThread_.joinable()) thumbSaveThread_.join();
+                thumbSaveThread_ = std::jthread([this, thumbPath](std::stop_token) {
+                    pipeline_->SavePersistentThumbs(thumbPath);
+                });
+            }
         }
 
         gallery->SetImagesGrouped(results);
@@ -510,6 +548,14 @@ LRESULT Application::HandleMessage(UINT msg, WPARAM wParam, LPARAM lParam)
             OnMouseUp(GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam));
             return 0;
 
+        case WM_MBUTTONDOWN:
+            OnMiddleMouseDown(GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam));
+            return 0;
+
+        case WM_MBUTTONUP:
+            OnMiddleMouseUp(GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam));
+            return 0;
+
         case WM_DROPFILES:
             OnDropFiles(reinterpret_cast<HDROP>(wParam));
             return 0;
@@ -655,6 +701,26 @@ void Application::OnMouseUp(int x, int y)
     if (viewManager_) {
         viewManager_->OnMouseUp(static_cast<float>(x) / dpiScale_,
                                  static_cast<float>(y) / dpiScale_);
+    }
+    needsRender_ = true;
+}
+
+void Application::OnMiddleMouseDown(int x, int y)
+{
+    SetCapture(hwnd_);
+    if (viewManager_) {
+        viewManager_->OnMiddleMouseDown(static_cast<float>(x) / dpiScale_,
+                                         static_cast<float>(y) / dpiScale_);
+    }
+    needsRender_ = true;
+}
+
+void Application::OnMiddleMouseUp(int x, int y)
+{
+    ReleaseCapture();
+    if (viewManager_) {
+        viewManager_->OnMiddleMouseUp(static_cast<float>(x) / dpiScale_,
+                                       static_cast<float>(y) / dpiScale_);
     }
     needsRender_ = true;
 }
@@ -934,6 +1000,167 @@ void Application::AddAlbumFolder()
     StartFullScan();
 }
 
+
+// --- Scan cache persistence (binary format) ---
+
+std::filesystem::path Application::GetScanCachePath() const
+{
+    wchar_t exePath[MAX_PATH];
+    if (GetModuleFileNameW(nullptr, exePath, MAX_PATH) == 0) return {};
+    return std::filesystem::path(exePath).parent_path() / L"scan_cache.bin";
+}
+
+void Application::SaveScanCache(const std::vector<ScannedImage>& results)
+{
+    auto filePath = GetScanCachePath();
+    if (filePath.empty()) return;
+
+    try {
+        // Binary layout:
+        //   Header (32 bytes): magic(4) + version(4) + entry_count(4) + string_blob_size(4) + timestamp(8) + reserved(8)
+        //   Entry table (entry_count * 12 bytes): path_offset(4) + path_len(2) + year(2) + month(2) + reserved(2)
+        //   String blob (string_blob_size bytes): packed wchar_t path strings
+
+        const uint32_t entryCount = static_cast<uint32_t>(results.size());
+        constexpr uint32_t kHeaderSize = 32;
+        constexpr uint32_t kEntrySize = 12;
+
+        // Build entry table and string blob
+        std::vector<uint8_t> entryTable(entryCount * kEntrySize);
+        std::vector<uint8_t> stringBlob;
+        stringBlob.reserve(entryCount * 160);  // ~80 wchar avg path
+
+        for (uint32_t i = 0; i < entryCount; ++i) {
+            const auto& img = results[i];
+            std::wstring pathStr = img.path.wstring();
+            uint32_t pathOffset = static_cast<uint32_t>(stringBlob.size());
+            uint16_t pathLen = static_cast<uint16_t>(pathStr.size());
+
+            // Append path wchars to string blob
+            const uint8_t* pathBytes = reinterpret_cast<const uint8_t*>(pathStr.data());
+            stringBlob.insert(stringBlob.end(), pathBytes, pathBytes + pathLen * sizeof(wchar_t));
+
+            // Fill entry
+            uint8_t* entry = entryTable.data() + i * kEntrySize;
+            memcpy(entry + 0, &pathOffset, 4);
+            memcpy(entry + 4, &pathLen, 2);
+            int16_t year = static_cast<int16_t>(img.year);
+            int16_t month = static_cast<int16_t>(img.month);
+            memcpy(entry + 6, &year, 2);
+            memcpy(entry + 8, &month, 2);
+            uint16_t reserved = 0;
+            memcpy(entry + 10, &reserved, 2);
+        }
+
+        uint32_t stringBlobSize = static_cast<uint32_t>(stringBlob.size());
+
+        // Build header
+        uint8_t header[kHeaderSize] = {};
+        memcpy(header + 0, "UIVC", 4);                         // magic
+        uint32_t version = 1;
+        memcpy(header + 4, &version, 4);                        // version
+        memcpy(header + 8, &entryCount, 4);                     // entry_count
+        memcpy(header + 12, &stringBlobSize, 4);                // string_blob_size
+        FILETIME ft;
+        GetSystemTimeAsFileTime(&ft);
+        uint64_t timestamp = (static_cast<uint64_t>(ft.dwHighDateTime) << 32) | ft.dwLowDateTime;
+        memcpy(header + 16, &timestamp, 8);                     // timestamp
+        // [24..31] reserved, already zero
+
+        // Write entire buffer in one call
+        FILE* f = _wfopen(filePath.c_str(), L"wb");
+        if (!f) return;
+
+        fwrite(header, 1, kHeaderSize, f);
+        if (!entryTable.empty()) fwrite(entryTable.data(), 1, entryTable.size(), f);
+        if (!stringBlob.empty()) fwrite(stringBlob.data(), 1, stringBlob.size(), f);
+        fclose(f);
+
+        DebugLog(("Saved scan cache (binary): " + std::to_string(results.size()) + " entries, "
+                  + std::to_string(kHeaderSize + entryTable.size() + stringBlob.size()) + " bytes").c_str());
+    } catch (...) {
+        DebugLog("Failed to save scan cache");
+    }
+}
+
+std::vector<ScannedImage> Application::LoadScanCache()
+{
+    std::vector<ScannedImage> results;
+    auto filePath = GetScanCachePath();
+    if (filePath.empty()) return results;
+
+    try {
+        FILE* f = _wfopen(filePath.c_str(), L"rb");
+        if (!f) return results;
+
+        // Get file size
+        _fseeki64(f, 0, SEEK_END);
+        long long fileSize = _ftelli64(f);
+        _fseeki64(f, 0, SEEK_SET);
+
+        constexpr uint32_t kHeaderSize = 32;
+        constexpr uint32_t kEntrySize = 12;
+
+        if (fileSize < kHeaderSize) { fclose(f); return results; }
+
+        // Read entire file in one call
+        std::vector<uint8_t> buf(static_cast<size_t>(fileSize));
+        size_t bytesRead = fread(buf.data(), 1, buf.size(), f);
+        fclose(f);
+
+        if (bytesRead != static_cast<size_t>(fileSize)) return results;
+
+        // Validate header
+        if (memcmp(buf.data(), "UIVC", 4) != 0) return results;  // bad magic
+
+        uint32_t version, entryCount, stringBlobSize;
+        memcpy(&version, buf.data() + 4, 4);
+        if (version != 1) return results;  // unsupported version
+
+        memcpy(&entryCount, buf.data() + 8, 4);
+        memcpy(&stringBlobSize, buf.data() + 12, 4);
+
+        // Validate total size
+        uint64_t expectedSize = static_cast<uint64_t>(kHeaderSize)
+                              + static_cast<uint64_t>(entryCount) * kEntrySize
+                              + stringBlobSize;
+        if (expectedSize != static_cast<uint64_t>(fileSize)) return results;
+
+        // Parse entries
+        const uint8_t* entryBase = buf.data() + kHeaderSize;
+        const uint8_t* blobBase = entryBase + static_cast<size_t>(entryCount) * kEntrySize;
+
+        results.reserve(entryCount);
+        for (uint32_t i = 0; i < entryCount; ++i) {
+            const uint8_t* entry = entryBase + i * kEntrySize;
+
+            uint32_t pathOffset;
+            uint16_t pathLen;
+            int16_t year, month;
+            memcpy(&pathOffset, entry + 0, 4);
+            memcpy(&pathLen, entry + 4, 2);
+            memcpy(&year, entry + 6, 2);
+            memcpy(&month, entry + 8, 2);
+
+            // Bounds check: path must fit within string blob
+            if (pathOffset + pathLen * sizeof(wchar_t) > stringBlobSize) return {};
+
+            const wchar_t* pathChars = reinterpret_cast<const wchar_t*>(blobBase + pathOffset);
+
+            ScannedImage img;
+            img.path = std::wstring(pathChars, pathLen);
+            img.year = year;
+            img.month = month;
+            results.push_back(std::move(img));
+        }
+
+        DebugLog(("Loaded scan cache (binary): " + std::to_string(results.size()) + " entries").c_str());
+    } catch (...) {
+        DebugLog("Failed to load scan cache");
+    }
+
+    return results;
+}
 
 } // namespace Core
 } // namespace UltraImageViewer

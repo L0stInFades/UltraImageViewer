@@ -333,8 +333,46 @@ void ImageViewer::OnMouseDown(float x, float y)
     hasDragged_ = false;
 }
 
+void ImageViewer::OnMiddleMouseDown(float x, float y)
+{
+    isMiddleDragging_ = true;
+    lastMouseX_ = x;
+    lastMouseY_ = y;
+}
+
+void ImageViewer::OnMiddleMouseUp(float x, float y)
+{
+    if (!isMiddleDragging_) return;
+    isMiddleDragging_ = false;
+
+    // Snap pan back to bounds
+    if (zoom_ <= 1.01f) {
+        panXSpring_.SetTarget(0.0f);
+        panYSpring_.SetTarget(0.0f);
+    } else {
+        auto bounds = CalculatePanBounds();
+        panXSpring_.SetTarget(std::max(bounds.left, std::min(panX_, bounds.right)));
+        panYSpring_.SetTarget(std::max(bounds.top, std::min(panY_, bounds.bottom)));
+    }
+}
+
 void ImageViewer::OnMouseMove(float x, float y)
 {
+    // Middle-button: pure pan, no dismiss/page logic
+    if (isMiddleDragging_) {
+        float dx = x - lastMouseX_;
+        float dy = y - lastMouseY_;
+        panX_ += dx;
+        panY_ += dy;
+        panXSpring_.SetValue(panX_);
+        panXSpring_.SetTarget(panX_);
+        panYSpring_.SetValue(panY_);
+        panYSpring_.SetTarget(panY_);
+        lastMouseX_ = x;
+        lastMouseY_ = y;
+        return;
+    }
+
     if (!isMouseDown_) return;
 
     float dx = x - lastMouseX_;

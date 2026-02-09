@@ -4,6 +4,7 @@
 #include <cmath>
 #include <map>
 #include <d2d1_1.h>
+#include <dwrite.h>
 
 using Microsoft::WRL::ComPtr;
 
@@ -502,6 +503,7 @@ void GalleryView::Render(Rendering::Direct2DRenderer* renderer)
 }
 
 // Helper: render a section-based image grid (shared by Photos tab & Folder Detail)
+// Collects visible paths into outVisiblePaths for pipeline prioritization.
 static void RenderImageGrid(
     ID2D1DeviceContext* ctx, ID2D1Factory* factory,
     Core::ImagePipeline* pipeline,
@@ -518,18 +520,33 @@ static void RenderImageGrid(
     IDWriteTextFormat* sectionFormat,
     IDWriteTextFormat* countRightFormat,
     float hoverX, float hoverY,
-    std::optional<size_t> skipIndex)
+    std::optional<size_t> skipIndex,
+    bool isFastScrolling,
+    float dpiScale,
+    std::vector<std::filesystem::path>* outVisiblePaths)
 {
+    // Cap thumbnail resolution to keep memory footprint small (160×160×4 = 100KB each)
+    // so the cache can hold 10,000+ thumbnails without eviction.
+    uint32_t targetPx = std::min(
+        static_cast<uint32_t>(grid.cellSize * dpiScale),
+        Theme::ThumbnailMaxPx);
+
+    // Prefetch buffer: pre-decode 1.5 screens above and below the viewport
+    // so thumbnails are ready before the user scrolls to them.
+    float prefetchMargin = contentHeight * 1.5f;
+
     for (size_t s = 0; s < sections.size(); ++s) {
         const auto& section = sections[s];
         if (s >= layouts.size()) break;
         const auto& sl = layouts[s];
 
         float sectionEndY = sl.contentY + sl.rows * (grid.cellSize + grid.gap);
-        if (sectionEndY - scroll < 0.0f) continue;
-        if (sl.headerY - scroll > contentHeight) break;
+        // Skip sections entirely above prefetch zone
+        if (sectionEndY - scroll < -prefetchMargin) continue;
+        // Stop once past prefetch zone
+        if (sl.headerY - scroll > contentHeight + prefetchMargin) break;
 
-        // Section header
+        // Section header (only draw if on screen)
         float headerScreenY = sl.headerY - scroll;
         if (headerScreenY + Theme::SectionHeaderHeight > 0 && headerScreenY < contentHeight) {
             if (sectionFormat && textBrush) {
@@ -558,37 +575,61 @@ static void RenderImageGrid(
             float cellX = grid.paddingX + localCol * (grid.cellSize + grid.gap);
             float cellY = sl.contentY + localRow * (grid.cellSize + grid.gap) - scroll;
 
-            if (cellY + grid.cellSize < 0.0f) continue;
-            if (cellY > contentHeight) break;
+            // Skip cells above prefetch zone
+            if (cellY + grid.cellSize < -prefetchMargin) continue;
+            // Stop past prefetch zone
+            if (cellY > contentHeight + prefetchMargin) break;
 
             size_t globalIndex = section.startIndex + i;
             if (globalIndex >= images.size()) break;
+
+            bool onScreen = (cellY + grid.cellSize >= 0.0f && cellY <= contentHeight);
 
             D2D1_RECT_F cellRect = D2D1::RectF(
                 cellX, cellY, cellX + grid.cellSize, cellY + grid.cellSize);
             D2D1_ROUNDED_RECT roundedCell = {cellRect, cornerRadius, cornerRadius};
 
-            // Placeholder background
-            if (cellBrush) {
+            // Placeholder background (only for on-screen cells)
+            if (onScreen && cellBrush) {
                 ctx->FillRoundedRectangle(roundedCell, cellBrush);
             }
 
             if (skipIndex.has_value() && globalIndex == skipIndex.value()) continue;
 
-            // Thumbnail with rounded corners
-            auto thumbnail = pipeline ? pipeline->GetThumbnail(images[globalIndex]) : nullptr;
-            if (thumbnail) {
-                float cellW = cellRect.right - cellRect.left;
-                float cellH = cellRect.bottom - cellRect.top;
-                D2D1_RECT_F srcRect = ComputeCropRect(thumbnail.Get(), cellW, cellH);
-                DrawBitmapRounded(ctx, factory, thumbnail.Get(), cellRect, cornerRadius, &srcRect);
+            // Collect visible path (only actually on-screen cells, for eviction protection)
+            if (onScreen && outVisiblePaths) {
+                outVisiblePaths->push_back(images[globalIndex]);
             }
 
-            // Hover
-            if (hoverBrush &&
-                hoverX >= cellRect.left && hoverX <= cellRect.right &&
-                hoverY >= cellRect.top && hoverY <= cellRect.bottom) {
-                ctx->FillRoundedRectangle(roundedCell, hoverBrush);
+            // Thumbnail: request decode for visible + prefetch zone
+            Microsoft::WRL::ComPtr<ID2D1Bitmap> thumbnail;
+            if (pipeline) {
+                if (isFastScrolling) {
+                    // During fast scroll: show cached thumbnails on-screen, skip prefetch
+                    if (onScreen) {
+                        thumbnail = pipeline->GetCachedThumbnail(images[globalIndex]);
+                    }
+                } else {
+                    // Normal scroll: request for both visible and prefetch cells
+                    thumbnail = pipeline->RequestThumbnail(images[globalIndex], targetPx);
+                }
+            }
+
+            // Only draw on-screen cells
+            if (onScreen) {
+                if (thumbnail) {
+                    float cellW = cellRect.right - cellRect.left;
+                    float cellH = cellRect.bottom - cellRect.top;
+                    D2D1_RECT_F srcRect = ComputeCropRect(thumbnail.Get(), cellW, cellH);
+                    DrawBitmapRounded(ctx, factory, thumbnail.Get(), cellRect, cornerRadius, &srcRect);
+                }
+
+                // Hover
+                if (hoverBrush &&
+                    hoverX >= cellRect.left && hoverX <= cellRect.right &&
+                    hoverY >= cellRect.top && hoverY <= cellRect.bottom) {
+                    ctx->FillRoundedRectangle(roundedCell, hoverBrush);
+                }
             }
         }
     }
@@ -606,34 +647,28 @@ void GalleryView::RenderPhotosTab(Rendering::Direct2DRenderer* renderer,
 
     float scroll = scrollY_.GetValue();
 
+    // Flush decoded thumbnails to GPU (up to MaxBitmapsPerFrame per frame)
+    if (pipeline_) {
+        pipeline_->FlushReadyThumbnails(Theme::MaxBitmapsPerFrame);
+    }
+
     // === Image grid FIRST (rendered behind header) ===
     auto* factory = renderer->GetFactory();
+    float dpiScale = renderer->GetDpiX() / 96.0f;
+
+    std::vector<std::filesystem::path> visiblePaths;
     RenderImageGrid(ctx, factory, pipeline_,
         grid, images_, sectionLayouts_, sections_,
         scroll, contentHeight, viewWidth_,
         Theme::ThumbnailCornerRadius,
         cellBrush_.Get(), textBrush_.Get(), secondaryBrush_.Get(), hoverBrush_.Get(),
         sectionFormat_.Get(), countRightFormat_.Get(),
-        hoverX_, hoverY_, skipIndex_);
+        hoverX_, hoverY_, skipIndex_,
+        isFastScrolling_, dpiScale, &visiblePaths);
 
-    // Prefetch
-    if (pipeline_ && !images_.empty()) {
-        size_t centerEstimate = images_.size() / 2;
-        float centerWorldY = scroll + contentHeight * 0.5f;
-        for (size_t s = 0; s < sections_.size(); ++s) {
-            if (s < sectionLayouts_.size()) {
-                float secEnd = sectionLayouts_[s].contentY +
-                    sectionLayouts_[s].rows * (grid.cellSize + grid.gap);
-                if (centerWorldY < secEnd) {
-                    float localY = centerWorldY - sectionLayouts_[s].contentY;
-                    int row = std::max(0, static_cast<int>(localY / (grid.cellSize + grid.gap)));
-                    centerEstimate = sections_[s].startIndex + row * grid.columns;
-                    break;
-                }
-            }
-        }
-        centerEstimate = std::min(centerEstimate, images_.size() - 1);
-        pipeline_->PrefetchAround(images_, centerEstimate, 8);
+    // Tell pipeline which paths are visible for prioritization
+    if (pipeline_ && !visiblePaths.empty()) {
+        pipeline_->SetVisibleRange(visiblePaths);
     }
 
     // === Header overlay (covers scrolling content) ===
@@ -731,6 +766,11 @@ void GalleryView::RenderPhotosTab(Rendering::Direct2DRenderer* renderer,
 void GalleryView::RenderAlbumsTab(Rendering::Direct2DRenderer* renderer,
                                    ID2D1DeviceContext* ctx, float contentHeight)
 {
+    // Flush decoded thumbnails to GPU
+    if (pipeline_) {
+        pipeline_->FlushReadyThumbnails(Theme::MaxBitmapsPerFrame);
+    }
+
     auto* factory = renderer->GetFactory();
     float scroll = albumsScrollY_.GetValue();
 
@@ -781,7 +821,12 @@ void GalleryView::RenderAlbumsTab(Rendering::Direct2DRenderer* renderer,
             ctx->FillRoundedRectangle(roundedImg, cellBrush_.Get());
         }
 
-        auto thumbnail = pipeline_ ? pipeline_->GetThumbnail(folderAlbums_[i].coverImage) : nullptr;
+        uint32_t albumTargetPx = std::min(
+            static_cast<uint32_t>(ag.cardWidth * (renderer ? renderer->GetDpiX() / 96.0f : 1.0f)),
+            Theme::ThumbnailMaxPx);
+        auto thumbnail = pipeline_
+            ? pipeline_->RequestThumbnail(folderAlbums_[i].coverImage, albumTargetPx)
+            : nullptr;
         if (thumbnail) {
             D2D1_RECT_F srcRect = ComputeCropRect(thumbnail.Get(), ag.cardWidth, ag.imageHeight);
             DrawBitmapRounded(ctx, factory, thumbnail.Get(), imgRect, cornerRadius, &srcRect);
@@ -867,34 +912,28 @@ void GalleryView::RenderFolderDetail(Rendering::Direct2DRenderer* renderer,
 
     float scroll = folderDetailScrollY_.GetValue();
 
+    // Flush decoded thumbnails to GPU
+    if (pipeline_) {
+        pipeline_->FlushReadyThumbnails(Theme::MaxBitmapsPerFrame);
+    }
+
     // === Image grid FIRST (rendered behind header) ===
     auto* factory = renderer->GetFactory();
+    float dpiScale = renderer->GetDpiX() / 96.0f;
+
+    std::vector<std::filesystem::path> visiblePaths;
     RenderImageGrid(ctx, factory, pipeline_,
         grid, folderDetailImages_, folderDetailSectionLayouts_, folderDetailSections_,
         scroll, contentHeight, viewWidth_,
         Theme::ThumbnailCornerRadius,
         cellBrush_.Get(), textBrush_.Get(), secondaryBrush_.Get(), hoverBrush_.Get(),
         sectionFormat_.Get(), countRightFormat_.Get(),
-        hoverX_, hoverY_, skipIndex_);
+        hoverX_, hoverY_, skipIndex_,
+        isFastScrolling_, dpiScale, &visiblePaths);
 
-    // Prefetch
-    if (pipeline_ && !folderDetailImages_.empty()) {
-        size_t centerEstimate = folderDetailImages_.size() / 2;
-        float centerWorldY = scroll + contentHeight * 0.5f;
-        for (size_t s = 0; s < folderDetailSections_.size(); ++s) {
-            if (s < folderDetailSectionLayouts_.size()) {
-                float secEnd = folderDetailSectionLayouts_[s].contentY +
-                    folderDetailSectionLayouts_[s].rows * (grid.cellSize + grid.gap);
-                if (centerWorldY < secEnd) {
-                    float localY = centerWorldY - folderDetailSectionLayouts_[s].contentY;
-                    int row = std::max(0, static_cast<int>(localY / (grid.cellSize + grid.gap)));
-                    centerEstimate = folderDetailSections_[s].startIndex + row * grid.columns;
-                    break;
-                }
-            }
-        }
-        centerEstimate = std::min(centerEstimate, folderDetailImages_.size() - 1);
-        pipeline_->PrefetchAround(folderDetailImages_, centerEstimate, 8);
+    // Tell pipeline which paths are visible for prioritization
+    if (pipeline_ && !visiblePaths.empty()) {
+        pipeline_->SetVisibleRange(visiblePaths);
     }
 
     // === Header overlay (covers scrolling content) ===
@@ -904,7 +943,7 @@ void GalleryView::RenderFolderDetail(Rendering::Direct2DRenderer* renderer,
             bgBrush_.Get());
     }
 
-    // Back button (pill shape)  — Y: 10..38
+    // Back button (pill shape) + folder title on same row — Y: 10..38
     {
         float btnX = Theme::GalleryPadding;
         float btnY = 10.0f;
@@ -926,23 +965,42 @@ void GalleryView::RenderFolderDetail(Rendering::Direct2DRenderer* renderer,
             ctx->DrawText(L"\u2190 Back", 6, backButtonFormat_.Get(), textRect, accentBrush_.Get());
             backButtonFormat_->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_LEADING);
         }
+
+        // Folder title — to the right of back button, same row, with ellipsis trimming
+        if (textBrush_ && backButtonFormat_) {
+            float titleX = btnX + btnW + 10.0f;
+            float titleMaxW = viewWidth_ - Theme::GalleryPadding - titleX;
+            if (titleMaxW > 0) {
+                Microsoft::WRL::ComPtr<IDWriteFactory> dwFactory;
+                HRESULT hr = DWriteCreateFactory(
+                    DWRITE_FACTORY_TYPE_SHARED,
+                    __uuidof(IDWriteFactory),
+                    reinterpret_cast<IUnknown**>(dwFactory.GetAddressOf()));
+                if (SUCCEEDED(hr) && dwFactory) {
+                    Microsoft::WRL::ComPtr<IDWriteTextLayout> layout;
+                    hr = dwFactory->CreateTextLayout(
+                        album.displayName.c_str(),
+                        static_cast<UINT32>(album.displayName.size()),
+                        backButtonFormat_.Get(),
+                        titleMaxW, btnH, &layout);
+                    if (SUCCEEDED(hr) && layout) {
+                        layout->SetWordWrapping(DWRITE_WORD_WRAPPING_NO_WRAP);
+                        Microsoft::WRL::ComPtr<IDWriteInlineObject> ellipsis;
+                        dwFactory->CreateEllipsisTrimmingSign(backButtonFormat_.Get(), &ellipsis);
+                        DWRITE_TRIMMING trimming = { DWRITE_TRIMMING_GRANULARITY_CHARACTER, 0, 0 };
+                        layout->SetTrimming(&trimming, ellipsis.Get());
+                        ctx->DrawTextLayout(D2D1::Point2F(titleX, btnY), layout.Get(), textBrush_.Get());
+                    }
+                }
+            }
+        }
     }
 
-    // Folder title  — Y: 42..72
-    if (textBrush_ && titleFormat_) {
-        D2D1_RECT_F titleRect = D2D1::RectF(
-            Theme::GalleryPadding, 42.0f,
-            viewWidth_ - Theme::GalleryPadding, 72.0f);
-        ctx->DrawText(album.displayName.c_str(),
-                      static_cast<UINT32>(album.displayName.size()),
-                      titleFormat_.Get(), titleRect, textBrush_.Get());
-    }
-
-    // Subtitle  — Y: 76..92  (well within 100px header)
+    // Subtitle — Y: 42..58 (shifted up since title moved into back button row)
     if (countFormat_ && secondaryBrush_) {
         D2D1_RECT_F subtitleRect = D2D1::RectF(
-            Theme::GalleryPadding, 76.0f,
-            viewWidth_ - Theme::GalleryPadding, 92.0f);
+            Theme::GalleryPadding, 42.0f,
+            viewWidth_ - Theme::GalleryPadding, 58.0f);
         std::wstring sub = FormatNumber(folderDetailImages_.size()) + L" photos";
         ctx->DrawText(sub.c_str(), static_cast<UINT32>(sub.size()),
                       countFormat_.Get(), subtitleRect, secondaryBrush_.Get());
@@ -1034,6 +1092,27 @@ void GalleryView::Update(float deltaTime)
     folderDetailScrollY_.Update(deltaTime);
     folderSlide_.Update(deltaTime);
     tabSlide_.Update(deltaTime);
+
+    // --- Fast-scroll detection ---
+    {
+        // Pick the active scroll animation's velocity
+        float rawVelocity = 0.0f;
+        if (activeTab_ == GalleryTab::Photos) {
+            rawVelocity = std::abs(scrollY_.GetVelocity());
+        } else if (inFolderDetail_) {
+            rawVelocity = std::abs(folderDetailScrollY_.GetVelocity());
+        } else {
+            rawVelocity = std::abs(albumsScrollY_.GetVelocity());
+        }
+
+        scrollVelocitySmoothed_ = scrollVelocitySmoothed_ * 0.8f + rawVelocity * 0.2f;
+        bool wasFastScrolling = isFastScrolling_;
+        isFastScrolling_ = scrollVelocitySmoothed_ > Theme::FastScrollThreshold;
+
+        if (isFastScrolling_ && !wasFastScrolling && pipeline_) {
+            pipeline_->InvalidateRequests();
+        }
+    }
 
     // Check folder navigation transition completion
     if (folderTransitionActive_ && folderSlide_.IsFinished()) {
@@ -1208,9 +1287,13 @@ void GalleryView::OnMouseUp(float x, float y)
             return;
         }
 
-        // Back button in folder detail
+        // Back button in folder detail — match actual pill rect
         if (activeTab_ == GalleryTab::Albums && inFolderDetail_) {
-            if (y < Theme::GalleryHeaderHeight && x < viewWidth_ * 0.5f) {
+            float btnX = Theme::GalleryPadding;
+            float btnY = 10.0f;
+            float btnW = 76.0f;
+            float btnH = 28.0f;
+            if (x >= btnX && x <= btnX + btnW && y >= btnY && y <= btnY + btnH) {
                 ExitFolderDetail();
                 consumedClick_ = true;
                 return;

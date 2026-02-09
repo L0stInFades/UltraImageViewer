@@ -75,6 +75,8 @@ private:
     void OnMouseDown(int x, int y);
     void OnMouseMove(int x, int y);
     void OnMouseUp(int x, int y);
+    void OnMiddleMouseDown(int x, int y);
+    void OnMiddleMouseUp(int x, int y);
 
     // Image management
     std::vector<std::filesystem::path> ShowOpenDialog();
@@ -149,6 +151,14 @@ private:
 
     void StartFullScan();
     void CheckScanProgress();
+
+    // Scan cache persistence
+    std::filesystem::path GetScanCachePath() const;
+    void SaveScanCache(const std::vector<ScannedImage>& results);
+    std::vector<ScannedImage> LoadScanCache();
+
+    // Persistent thumbnail cache (background save)
+    std::jthread thumbSaveThread_;
 };
 
 } // namespace Core
