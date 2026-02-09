@@ -169,7 +169,8 @@ std::vector<std::filesystem::path> ImagePipeline::ScanDirectory(const std::files
     return result;
 }
 
-std::vector<ScannedImage> ImagePipeline::ScanSystemImages(
+std::vector<ScannedImage> ImagePipeline::ScanFolders(
+    const std::vector<std::filesystem::path>& folders,
     std::atomic<bool>& cancelFlag,
     std::atomic<size_t>& outCount)
 {
@@ -191,28 +192,8 @@ std::vector<ScannedImage> ImagePipeline::ScanSystemImages(
         L"x64", L"x86", L"obj", L"bin"
     };
 
-    // Known folders to scan
-    struct FolderEntry {
-        KNOWNFOLDERID id;
-        const wchar_t* name;
-    };
-    FolderEntry folders[] = {
-        {FOLDERID_Pictures,       L"Pictures"},
-        {FOLDERID_Desktop,        L"Desktop"},
-        {FOLDERID_Downloads,      L"Downloads"},
-        {FOLDERID_CameraRoll,     L"CameraRoll"},
-        {FOLDERID_SavedPictures,  L"SavedPictures"},
-    };
-
-    for (const auto& folder : folders) {
+    for (const auto& dir : folders) {
         if (cancelFlag) break;
-
-        PWSTR folderPath = nullptr;
-        if (FAILED(SHGetKnownFolderPath(folder.id, 0, nullptr, &folderPath))) {
-            continue;
-        }
-        std::filesystem::path dir(folderPath);
-        CoTaskMemFree(folderPath);
 
         if (!std::filesystem::exists(dir)) continue;
 
@@ -297,6 +278,35 @@ std::vector<ScannedImage> ImagePipeline::ScanSystemImages(
         std::to_wstring(result.size()) + L" images found\n").c_str());
 
     return result;
+}
+
+std::vector<ScannedImage> ImagePipeline::ScanSystemImages(
+    std::atomic<bool>& cancelFlag,
+    std::atomic<size_t>& outCount)
+{
+    // Resolve system known folders to paths, then delegate to ScanFolders
+    struct FolderEntry {
+        KNOWNFOLDERID id;
+        const wchar_t* name;
+    };
+    FolderEntry knownFolders[] = {
+        {FOLDERID_Pictures,       L"Pictures"},
+        {FOLDERID_Desktop,        L"Desktop"},
+        {FOLDERID_Downloads,      L"Downloads"},
+        {FOLDERID_CameraRoll,     L"CameraRoll"},
+        {FOLDERID_SavedPictures,  L"SavedPictures"},
+    };
+
+    std::vector<std::filesystem::path> folders;
+    for (const auto& folder : knownFolders) {
+        PWSTR folderPath = nullptr;
+        if (SUCCEEDED(SHGetKnownFolderPath(folder.id, 0, nullptr, &folderPath))) {
+            folders.emplace_back(folderPath);
+            CoTaskMemFree(folderPath);
+        }
+    }
+
+    return ScanFolders(folders, cancelFlag, outCount);
 }
 
 bool ImagePipeline::HasThumbnail(const std::filesystem::path& path) const

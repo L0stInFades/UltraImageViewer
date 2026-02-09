@@ -9,9 +9,11 @@
 #include <d2d1helper.h>
 #include <windowsx.h>
 #include <shlobj.h>
+#include <shobjidl.h>
 #include <knownfolders.h>
 #include <fstream>
 #include <sstream>
+#include <wrl/client.h>
 
 #pragma comment(lib, "shcore.lib")
 #pragma comment(lib, "shlwapi.lib")
@@ -60,7 +62,7 @@ Application::~Application()
 bool Application::Initialize(HINSTANCE hInstance)
 {
     hInstance_ = hInstance;
-    DebugLog("=== UltraImageViewer starting ===");
+    DebugLog("=== Shiguang starting ===");
 
     if (!InitializeWindow()) {
         DebugLog("FAIL: InitializeWindow");
@@ -85,6 +87,7 @@ void Application::Shutdown()
         return;
     }
     SaveRecents();
+    SaveAlbumFolders();
 
     // Cancel any ongoing scan
     scanCancelled_ = true;
@@ -126,9 +129,14 @@ int Application::Run(int nCmdShow)
     ShowWindow(hwnd_, nCmdShow);
     UpdateWindow(hwnd_);
 
-    // Auto-scan system images if no images loaded via command line
+    // Auto-scan: prefer saved album folders, fall back to system defaults
     if (currentImages_.empty()) {
-        StartSystemScan();
+        LoadAlbumFolders();
+        if (!albumFolders_.empty()) {
+            StartAlbumScan();
+        } else {
+            StartSystemScan();
+        }
     }
 
     QueryPerformanceFrequency(&perfFrequency_);
@@ -509,6 +517,12 @@ void Application::OnSize(UINT width, UINT height)
 
 void Application::OnKeyDown(UINT key)
 {
+    // Ctrl+D: add album folder
+    if ((GetKeyState(VK_CONTROL) & 0x8000) && (key == 'D')) {
+        AddAlbumFolder();
+        return;
+    }
+
     // Ctrl+O: open file dialog (manual override)
     if ((GetKeyState(VK_CONTROL) & 0x8000) && (key == 'O')) {
         // Cancel any ongoing scan
@@ -773,6 +787,151 @@ std::filesystem::path Application::GetRecentFilePath() const
     std::filesystem::path base(outPath);
     CoTaskMemFree(outPath);
     return base / L"UltraImageViewer" / L"recent.txt";
+}
+
+// --- Album folder management ---
+
+std::filesystem::path Application::GetAlbumFilePath() const
+{
+    PWSTR outPath = nullptr;
+    if (FAILED(SHGetKnownFolderPath(FOLDERID_LocalAppData, 0, nullptr, &outPath))) {
+        return {};
+    }
+    std::filesystem::path base(outPath);
+    CoTaskMemFree(outPath);
+    return base / L"UltraImageViewer" / L"albums.txt";
+}
+
+void Application::LoadAlbumFolders()
+{
+    albumFolders_.clear();
+    auto filePath = GetAlbumFilePath();
+    if (filePath.empty()) return;
+
+    std::wifstream in(filePath);
+    if (!in.is_open()) return;
+
+    std::wstring line;
+    while (std::getline(in, line)) {
+        if (line.empty()) continue;
+        std::filesystem::path dir(line);
+        if (std::filesystem::is_directory(dir)) {
+            albumFolders_.push_back(dir);
+        }
+    }
+
+    DebugLog(("Loaded " + std::to_string(albumFolders_.size()) + " album folders").c_str());
+}
+
+void Application::SaveAlbumFolders()
+{
+    auto filePath = GetAlbumFilePath();
+    if (filePath.empty()) return;
+
+    std::filesystem::create_directories(filePath.parent_path());
+    std::wofstream out(filePath, std::ios::trunc);
+    for (const auto& dir : albumFolders_) {
+        out << dir.wstring() << L"\n";
+    }
+}
+
+std::filesystem::path Application::ShowFolderDialog()
+{
+    Microsoft::WRL::ComPtr<IFileDialog> dialog;
+    if (FAILED(CoCreateInstance(CLSID_FileOpenDialog, nullptr,
+                                CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&dialog))))
+        return {};
+
+    DWORD options = 0;
+    dialog->GetOptions(&options);
+    dialog->SetOptions(options | FOS_PICKFOLDERS | FOS_FORCEFILESYSTEM);
+    dialog->SetTitle(L"Select Album Folder");
+
+    if (dialog->Show(hwnd_) != S_OK)
+        return {};
+
+    Microsoft::WRL::ComPtr<IShellItem> item;
+    dialog->GetResult(&item);
+    if (!item) return {};
+
+    PWSTR path = nullptr;
+    if (FAILED(item->GetDisplayName(SIGDN_FILESYSPATH, &path)))
+        return {};
+
+    std::filesystem::path result(path);
+    CoTaskMemFree(path);
+    return result;
+}
+
+void Application::AddAlbumFolder()
+{
+    auto folder = ShowFolderDialog();
+    if (folder.empty()) return;
+
+    // Check for duplicate
+    for (const auto& existing : albumFolders_) {
+        if (std::filesystem::equivalent(existing, folder)) {
+            DebugLog("Album folder already exists, skipping");
+            return;
+        }
+    }
+
+    albumFolders_.push_back(folder);
+    SaveAlbumFolders();
+
+    DebugLog(("Added album folder: " + folder.string()).c_str());
+
+    // Cancel current scan and rescan all album folders
+    if (isScanning_) {
+        scanCancelled_ = true;
+        if (scanThread_.joinable()) {
+            scanThread_.request_stop();
+            scanThread_.join();
+        }
+        isScanning_ = false;
+    }
+
+    StartAlbumScan();
+}
+
+void Application::StartAlbumScan()
+{
+    DebugLog("Starting album folder scan...");
+    isScanning_ = true;
+    scanCancelled_ = false;
+    scanProgress_ = 0;
+    scanDirty_ = false;
+    lastGalleryUpdateCount_ = 0;
+
+    if (viewManager_) {
+        viewManager_->GetGalleryView()->SetScanningState(true, 0);
+    }
+
+    // Capture a copy of the folder list for the thread
+    auto folders = albumFolders_;
+
+    scanThread_ = std::jthread([this, folders = std::move(folders)](std::stop_token) {
+        CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+
+        try {
+            auto results = ImagePipeline::ScanFolders(folders, scanCancelled_, scanProgress_);
+
+            DebugLog(("Album scan found " + std::to_string(results.size()) + " images").c_str());
+
+            {
+                std::lock_guard lock(scanMutex_);
+                scannedResults_ = std::move(results);
+            }
+            scanDirty_ = true;
+        } catch (const std::exception& e) {
+            DebugLog(("Album scan exception: " + std::string(e.what())).c_str());
+        } catch (...) {
+            DebugLog("Album scan unknown exception");
+        }
+
+        isScanning_ = false;
+        CoUninitialize();
+    });
 }
 
 } // namespace Core

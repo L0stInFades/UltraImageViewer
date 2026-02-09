@@ -49,6 +49,12 @@ public:
     // Scan a directory for supported image files
     static std::vector<std::filesystem::path> ScanDirectory(const std::filesystem::path& dir);
 
+    // Scan arbitrary folders recursively for images (with date grouping)
+    static std::vector<ScannedImage> ScanFolders(
+        const std::vector<std::filesystem::path>& folders,
+        std::atomic<bool>& cancelFlag,
+        std::atomic<size_t>& outCount);
+
     // Scan system image folders (Pictures, Desktop, Downloads) recursively
     static std::vector<ScannedImage> ScanSystemImages(
         std::atomic<bool>& cancelFlag,

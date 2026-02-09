@@ -78,6 +78,14 @@ private:
 
     // Image management
     std::vector<std::filesystem::path> ShowOpenDialog();
+    std::filesystem::path ShowFolderDialog();
+
+    // Album folders
+    void AddAlbumFolder();
+    void StartAlbumScan();
+    void LoadAlbumFolders();
+    void SaveAlbumFolders();
+    std::filesystem::path GetAlbumFilePath() const;
 
     // Recent files
     void LoadRecents();
@@ -93,7 +101,7 @@ private:
     HWND hwnd_ = nullptr;
 
     // Window state
-    std::wstring windowTitle_ = L"UltraImageViewer";
+    std::wstring windowTitle_ = L"\u62FE\u5149 Sh\u00EDgu\u0101ng";
     UINT windowWidth_ = 1280;
     UINT windowHeight_ = 720;
     float dpiScale_ = 1.0f;
@@ -110,6 +118,9 @@ private:
 
     // Current image list
     std::vector<std::filesystem::path> currentImages_;
+
+    // Album folders (user-specified)
+    std::vector<std::filesystem::path> albumFolders_;
 
     // Recent files
     std::vector<std::filesystem::path> recentItems_;

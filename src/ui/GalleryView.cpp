@@ -230,7 +230,7 @@ void GalleryView::Render(Rendering::Direct2DRenderer* renderer)
             }
         } else if (images_.empty()) {
             if (secondaryBrush_) {
-                std::wstring sub = L"No photos found  \u00B7  Ctrl+O to browse";
+                std::wstring sub = L"No photos found  \u00B7  Ctrl+O browse files  \u00B7  Ctrl+D add album folder";
                 ctx->DrawText(sub.c_str(), static_cast<UINT32>(sub.size()),
                               countFormat_.Get(), subtitleRect, secondaryBrush_.Get());
             }
@@ -407,7 +407,8 @@ void GalleryView::Render(Rendering::Direct2DRenderer* renderer)
             if (hintFormat) {
                 hintFormat->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER);
                 hintFormat->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_NEAR);
-                ctx->DrawText(L"Drag images here or press Ctrl+O", 32,
+                const wchar_t* hint = L"Drag images here \u00B7 Ctrl+O browse files \u00B7 Ctrl+D add album folder";
+                ctx->DrawText(hint, static_cast<UINT32>(wcslen(hint)),
                               hintFormat.Get(), hintRect, secondaryBrush_.Get());
             }
         }
