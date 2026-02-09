@@ -621,6 +621,22 @@ void Direct2DRenderer::Resize(uint32_t width, uint32_t height)
     }
 }
 
+ComPtr<ID2D1Bitmap1> Direct2DRenderer::CreateOffscreenBitmap(uint32_t w, uint32_t h)
+{
+    if (!context_ || w == 0 || h == 0) return nullptr;
+
+    D2D1_BITMAP_PROPERTIES1 props = {};
+    props.pixelFormat = {DXGI_FORMAT_B8G8R8A8_UNORM, D2D1_ALPHA_MODE_PREMULTIPLIED};
+    props.bitmapOptions = D2D1_BITMAP_OPTIONS_TARGET;  // TARGET only, no CANNOT_DRAW
+    props.dpiX = dpiX_;
+    props.dpiY = dpiY_;
+
+    ComPtr<ID2D1Bitmap1> bitmap;
+    HRESULT hr = context_->CreateBitmap(D2D1::SizeU(w, h), nullptr, 0, &props, &bitmap);
+    if (FAILED(hr)) return nullptr;
+    return bitmap;
+}
+
 ComPtr<ID2D1SolidColorBrush> Direct2DRenderer::CreateBrush(const D2D1_COLOR_F& color)
 {
     if (!context_) {

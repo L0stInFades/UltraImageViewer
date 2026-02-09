@@ -1,6 +1,7 @@
 #pragma once
 
-#include <d2d1.h>
+#include <d2d1_1.h>
+#include <d2d1effects.h>
 #include <dwrite.h>
 #include <wrl/client.h>
 #include <vector>
@@ -123,7 +124,17 @@ private:
                          float contentHeight);
     void RenderFolderDetail(Rendering::Direct2DRenderer* renderer, ID2D1DeviceContext* ctx,
                             float contentHeight);
-    void RenderTabBar(ID2D1DeviceContext* ctx);
+
+    // Glass rendering
+    void RenderGlassElement(ID2D1DeviceContext* ctx, ID2D1Bitmap* contentBitmap,
+                            const D2D1_ROUNDED_RECT& pill,
+                            ID2D1SolidColorBrush* tintBrush,
+                            ID2D1SolidColorBrush* borderBrush);
+    void RenderGlassTabBar(ID2D1DeviceContext* ctx, ID2D1Bitmap* contentBitmap);
+    void RenderGlassBackButton(ID2D1DeviceContext* ctx, ID2D1Bitmap* contentBitmap);
+    void EnsureOffscreenBitmap(Rendering::Direct2DRenderer* renderer);
+    void EnsureGlassEffects(ID2D1DeviceContext* ctx);
+    void GenerateDisplacementMap(ID2D1DeviceContext* ctx, float width, float height, float cornerRadius);
 
     // Albums helpers
     void BuildFolderAlbums(const std::vector<Core::ScannedImage>& scannedImages);
@@ -209,10 +220,23 @@ private:
     Microsoft::WRL::ComPtr<IDWriteTextFormat> countRightFormat_;  // Right-aligned count
     Microsoft::WRL::ComPtr<ID2D1SolidColorBrush> hoverBrush_;
     Microsoft::WRL::ComPtr<ID2D1SolidColorBrush> scrollIndicatorBrush_;
-    Microsoft::WRL::ComPtr<ID2D1SolidColorBrush> tabBarBrush_;
-    Microsoft::WRL::ComPtr<ID2D1SolidColorBrush> tabBarGradientBrush_;
     Microsoft::WRL::ComPtr<IDWriteTextFormat> tabFormat_;
     Microsoft::WRL::ComPtr<IDWriteTextFormat> albumTitleFormat_;
+
+    // Glass effect resources
+    Microsoft::WRL::ComPtr<ID2D1Effect> glassBlurEffect_;
+    Microsoft::WRL::ComPtr<ID2D1Effect> glassDisplaceEffect_;
+    Microsoft::WRL::ComPtr<ID2D1Bitmap1> offscreenBitmap_;
+    Microsoft::WRL::ComPtr<ID2D1Bitmap> displacementMap_;
+    Microsoft::WRL::ComPtr<ID2D1SolidColorBrush> glassTintBrush_;
+    Microsoft::WRL::ComPtr<ID2D1SolidColorBrush> glassBorderBrush_;
+    Microsoft::WRL::ComPtr<ID2D1SolidColorBrush> glassHighlightBrush_;
+    Microsoft::WRL::ComPtr<ID2D1SolidColorBrush> glassActivePillBrush_;
+    Microsoft::WRL::ComPtr<ID2D1SolidColorBrush> glassActivePillBorderBrush_;
+    Microsoft::WRL::ComPtr<ID2D1SolidColorBrush> glassTabTextBrush_;
+    Microsoft::WRL::ComPtr<ID2D1SolidColorBrush> glassTabTextInactiveBrush_;
+    uint32_t offscreenW_ = 0, offscreenH_ = 0;
+    float displacementMapW_ = 0.0f, displacementMapH_ = 0.0f;
     Microsoft::WRL::ComPtr<IDWriteTextFormat> albumCountFormat_;
     Microsoft::WRL::ComPtr<IDWriteTextFormat> backButtonFormat_;
     Microsoft::WRL::ComPtr<IDWriteFactory> dwFactory_;  // Cached for per-frame text layout

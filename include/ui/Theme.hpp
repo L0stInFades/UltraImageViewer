@@ -27,9 +27,25 @@ namespace Theme {
     constexpr float ThumbnailCornerRadius = 8.0f;
     constexpr float TransitionCornerRadius = 8.0f;
 
-    // Tab bar
+    // Tab bar (legacy solid — kept for scroll math compatibility)
     constexpr float TabBarHeight = 56.0f;
     constexpr D2D1_COLOR_F TabBarBg = {0.08f, 0.08f, 0.09f, 0.97f};
+
+    // Glass design (iOS 26 Liquid Glass)
+    constexpr float GlassBlurSigma = 20.0f;
+    constexpr float GlassTabBarHeight = 48.0f;
+    constexpr float GlassTabBarMargin = 16.0f;
+    constexpr float GlassTabBarCornerRadius = 24.0f;  // = height/2, full pill
+    constexpr D2D1_COLOR_F GlassTintColor = {0.098f, 0.098f, 0.11f, 0.55f};
+    constexpr D2D1_COLOR_F GlassBorderColor = {1.0f, 1.0f, 1.0f, 0.12f};
+    constexpr D2D1_COLOR_F GlassHighlightColor = {1.0f, 1.0f, 1.0f, 0.20f};
+    constexpr D2D1_COLOR_F GlassActivePillColor = {1.0f, 1.0f, 1.0f, 0.10f};
+    constexpr D2D1_COLOR_F GlassActivePillBorder = {1.0f, 1.0f, 1.0f, 0.15f};
+    constexpr D2D1_COLOR_F GlassTabTextActive = {1.0f, 1.0f, 1.0f, 0.95f};
+    constexpr D2D1_COLOR_F GlassTabTextInactive = {1.0f, 1.0f, 1.0f, 0.55f};
+    constexpr float GlassDisplacementScale = 10.0f;
+    constexpr float GlassBackBtnHeight = 32.0f;
+    constexpr float GlassBackBtnPadding = 12.0f;
 
     // Gallery
     constexpr float MinCellSize = 200.0f;

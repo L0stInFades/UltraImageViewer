@@ -3,7 +3,9 @@
 #include <algorithm>
 #include <cmath>
 #include <map>
+#include <vector>
 #include <d2d1_1.h>
+#include <d2d1effects.h>
 #include <dwrite.h>
 
 using Microsoft::WRL::ComPtr;
@@ -306,9 +308,17 @@ void GalleryView::EnsureResources(Rendering::Direct2DRenderer* renderer)
     hoverBrush_ = renderer->CreateBrush(D2D1::ColorF(1.0f, 1.0f, 1.0f, 0.08f));
     scrollIndicatorBrush_ = renderer->CreateBrush(D2D1::ColorF(1.0f, 1.0f, 1.0f, 0.15f));
 
-    // Tab bar
-    tabBarBrush_ = renderer->CreateBrush(Theme::TabBarBg);
-    tabFormat_ = renderer->CreateTextFormat(L"Segoe UI", 12.0f, DWRITE_FONT_WEIGHT_SEMI_BOLD);
+    // Glass brushes
+    glassTintBrush_ = renderer->CreateBrush(Theme::GlassTintColor);
+    glassBorderBrush_ = renderer->CreateBrush(Theme::GlassBorderColor);
+    glassHighlightBrush_ = renderer->CreateBrush(Theme::GlassHighlightColor);
+    glassActivePillBrush_ = renderer->CreateBrush(Theme::GlassActivePillColor);
+    glassActivePillBorderBrush_ = renderer->CreateBrush(Theme::GlassActivePillBorder);
+    glassTabTextBrush_ = renderer->CreateBrush(Theme::GlassTabTextActive);
+    glassTabTextInactiveBrush_ = renderer->CreateBrush(Theme::GlassTabTextInactive);
+
+    // Tab bar text (glass style)
+    tabFormat_ = renderer->CreateTextFormat(L"Segoe UI", 13.0f, DWRITE_FONT_WEIGHT_SEMI_BOLD);
     if (tabFormat_) {
         tabFormat_->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER);
         tabFormat_->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
@@ -444,24 +454,27 @@ void GalleryView::Render(Rendering::Direct2DRenderer* renderer)
 {
     if (!renderer) return;
     EnsureResources(renderer);
+    EnsureOffscreenBitmap(renderer);
 
     auto* ctx = renderer->GetContext();
     if (!ctx) return;
 
-    ctx->Clear(Theme::Background);
+    EnsureGlassEffects(ctx);
 
-    // Flush decoded thumbnails once per frame (before any tab rendering)
+    // Flush decoded thumbnails once per frame
     if (pipeline_) {
         pipeline_->FlushReadyThumbnails(Theme::MaxBitmapsPerFrame);
     }
 
-    float contentHeight = viewHeight_ - Theme::TabBarHeight;
+    // --- Pass 1: Render content to offscreen bitmap (full viewport, no tab bar clip) ---
+    if (offscreenBitmap_) {
+        ctx->SetTarget(offscreenBitmap_.Get());
+    }
+    ctx->Clear(Theme::Background);
 
-    D2D1_RECT_F contentClip = D2D1::RectF(0, 0, viewWidth_, contentHeight);
-    ctx->PushAxisAlignedClip(contentClip, D2D1_ANTIALIAS_MODE_ALIASED);
-
+    // No clip at tab bar — content renders to full viewport (behind glass)
     if (activeTab_ == GalleryTab::Photos) {
-        RenderPhotosTab(renderer, ctx, contentHeight);
+        RenderPhotosTab(renderer, ctx, viewHeight_);
     } else {
         if (folderTransitionActive_) {
             float t = std::clamp(folderSlide_.GetValue(), 0.0f, 1.0f);
@@ -469,39 +482,61 @@ void GalleryView::Render(Rendering::Direct2DRenderer* renderer)
             D2D1_MATRIX_3X2_F savedTransform;
             ctx->GetTransform(&savedTransform);
 
-            // Albums grid slides left (parallax, 30% of screen width)
             ctx->SetTransform(
                 D2D1::Matrix3x2F::Translation(-t * viewWidth_ * 0.3f, 0) * savedTransform);
-            RenderAlbumsTab(renderer, ctx, contentHeight);
+            RenderAlbumsTab(renderer, ctx, viewHeight_);
 
-            // Folder detail slides in from right
             float detailOffset = (1.0f - t) * viewWidth_;
             ctx->SetTransform(
                 D2D1::Matrix3x2F::Translation(detailOffset, 0) * savedTransform);
-            // Opaque background so albums don't show through gaps
             if (bgBrush_) {
                 ctx->FillRectangle(
-                    D2D1::RectF(0, 0, viewWidth_, contentHeight), bgBrush_.Get());
+                    D2D1::RectF(0, 0, viewWidth_, viewHeight_), bgBrush_.Get());
             }
-            RenderFolderDetail(renderer, ctx, contentHeight);
+            RenderFolderDetail(renderer, ctx, viewHeight_);
 
-            // Edge shadow on left side of incoming folder detail
             if (scrollIndicatorBrush_) {
                 ctx->FillRectangle(
-                    D2D1::RectF(-8.0f, 0, 0, contentHeight), scrollIndicatorBrush_.Get());
+                    D2D1::RectF(-8.0f, 0, 0, viewHeight_), scrollIndicatorBrush_.Get());
             }
 
             ctx->SetTransform(savedTransform);
         } else if (inFolderDetail_) {
-            RenderFolderDetail(renderer, ctx, contentHeight);
+            RenderFolderDetail(renderer, ctx, viewHeight_);
         } else {
-            RenderAlbumsTab(renderer, ctx, contentHeight);
+            RenderAlbumsTab(renderer, ctx, viewHeight_);
         }
     }
 
-    ctx->PopAxisAlignedClip();
+    // --- Pass 2: Compose to swap chain ---
+    auto* swapTarget = renderer->GetRenderTarget();
+    if (swapTarget) {
+        ctx->SetTarget(swapTarget);
+    }
 
-    RenderTabBar(ctx);
+    // Blit full content from offscreen bitmap
+    if (offscreenBitmap_) {
+        ctx->DrawBitmap(offscreenBitmap_.Get());
+    }
+
+    // Generate displacement map for compact tab bar pill size
+    {
+        float margin = Theme::GlassTabBarMargin;
+        float maxBarW = 200.0f;
+        float barW = std::min(maxBarW, viewWidth_ - margin * 4.0f);
+        float barH = Theme::GlassTabBarHeight;
+        GenerateDisplacementMap(ctx, barW, barH, Theme::GlassTabBarCornerRadius);
+    }
+
+    // Glass tab bar overlay
+    if (offscreenBitmap_) {
+        RenderGlassTabBar(ctx, offscreenBitmap_.Get());
+
+        // Glass back button in folder detail
+        if (activeTab_ == GalleryTab::Albums && inFolderDetail_ && !folderTransitionActive_) {
+            RenderGlassBackButton(ctx, offscreenBitmap_.Get());
+        }
+    }
 }
 
 // Helper: render a section-based image grid (shared by Photos tab & Folder Detail)
@@ -645,7 +680,9 @@ void GalleryView::RenderPhotosTab(Rendering::Direct2DRenderer* renderer,
     cachedLayoutWidth_ = viewWidth_;
 
     ComputeSectionLayouts(grid);
-    maxScroll_ = std::max(0.0f, cachedTotalHeight_ - contentHeight);
+    // Add bottom padding so content can scroll fully above the floating glass tab bar
+    float glassOverlap = Theme::GlassTabBarHeight + Theme::GlassTabBarMargin * 2;
+    maxScroll_ = std::max(0.0f, cachedTotalHeight_ - contentHeight + glassOverlap);
 
     float scroll = scrollY_.GetValue();
 
@@ -792,7 +829,8 @@ void GalleryView::RenderAlbumsTab(Rendering::Direct2DRenderer* renderer,
 
     int numRows = static_cast<int>((folderAlbums_.size() + ag.columns - 1) / ag.columns);
     float totalHeight = startY + numRows * (ag.cardTotalHeight + ag.gap) + ag.paddingX;
-    albumsMaxScroll_ = std::max(0.0f, totalHeight - contentHeight);
+    float glassOverlap = Theme::GlassTabBarHeight + Theme::GlassTabBarMargin * 2;
+    albumsMaxScroll_ = std::max(0.0f, totalHeight - contentHeight + glassOverlap);
 
     for (size_t i = 0; i < folderAlbums_.size(); ++i) {
         int col = static_cast<int>(i) % ag.columns;
@@ -900,7 +938,8 @@ void GalleryView::RenderFolderDetail(Rendering::Direct2DRenderer* renderer,
 
     auto grid = CalculateGridLayout(viewWidth_);
     ComputeFolderDetailSectionLayouts(grid);
-    folderDetailMaxScroll_ = std::max(0.0f, folderDetailCachedTotalHeight_ - contentHeight);
+    float glassOverlap = Theme::GlassTabBarHeight + Theme::GlassTabBarMargin * 2;
+    folderDetailMaxScroll_ = std::max(0.0f, folderDetailCachedTotalHeight_ - contentHeight + glassOverlap);
 
     float scroll = folderDetailScrollY_.GetValue();
 
@@ -923,30 +962,14 @@ void GalleryView::RenderFolderDetail(Rendering::Direct2DRenderer* renderer,
         pipeline_->SetVisibleRange(visiblePaths);
     }
 
-    // === Header overlay (covers scrolling content) ===
-    if (bgBrush_) {
-        ctx->FillRectangle(
-            D2D1::RectF(0, 0, viewWidth_, Theme::GalleryHeaderHeight),
-            bgBrush_.Get());
-    }
-
-    // iOS-style back: "< 相册" in accent + folder title (bold, large) on second line
+    // === Header overlay — no opaque background, so glass back button shows blurred content ===
+    // Folder title positioned below the glass back button zone
     {
-        float lineY = 10.0f;
-        float lineH = 24.0f;
+        // Glass back button occupies: y=16 to y=48 (margin + height)
+        float titleY = Theme::GlassTabBarMargin + Theme::GlassBackBtnHeight + 8.0f;  // below glass pill
 
-        // "< 相册" — back text in accent color (hit area for click)
-        if (backButtonFormat_ && accentBrush_) {
-            D2D1_RECT_F backRect = D2D1::RectF(
-                Theme::GalleryPadding, lineY,
-                Theme::GalleryPadding + 80.0f, lineY + lineH);
-            ctx->DrawText(L"\u2039 \u76F8\u518C", 4,
-                          backButtonFormat_.Get(), backRect, accentBrush_.Get());
-        }
-
-        // Folder title — large bold, below the back text
+        // Folder title — large bold
         if (textBrush_ && titleFormat_) {
-            float titleY = lineY + lineH + 4.0f;
             float titleH = 36.0f;
             float titleMaxW = viewWidth_ - Theme::GalleryPadding * 2;
             if (titleMaxW > 0 && dwFactory_) {
@@ -969,11 +992,11 @@ void GalleryView::RenderFolderDetail(Rendering::Direct2DRenderer* renderer,
             }
         }
 
-        // Subtitle: photo count, below folder title
+        // Subtitle: photo count
         if (countFormat_ && secondaryBrush_) {
             D2D1_RECT_F subtitleRect = D2D1::RectF(
-                Theme::GalleryPadding, lineY + lineH + 42.0f,
-                viewWidth_ - Theme::GalleryPadding, lineY + lineH + 58.0f);
+                Theme::GalleryPadding, titleY + 38.0f,
+                viewWidth_ - Theme::GalleryPadding, titleY + 54.0f);
             std::wstring sub = FormatNumber(folderDetailImages_.size()) + L" photos";
             ctx->DrawText(sub.c_str(), static_cast<UINT32>(sub.size()),
                           countFormat_.Get(), subtitleRect, secondaryBrush_.Get());
@@ -996,64 +1019,336 @@ void GalleryView::RenderFolderDetail(Rendering::Direct2DRenderer* renderer,
     }
 }
 
-void GalleryView::RenderTabBar(ID2D1DeviceContext* ctx)
+// ======================= GLASS EFFECTS =======================
+
+void GalleryView::EnsureOffscreenBitmap(Rendering::Direct2DRenderer* renderer)
 {
-    float tabBarTop = viewHeight_ - Theme::TabBarHeight;
+    // viewWidth_/viewHeight_ are in DIPs — convert to physical pixels to match swap chain
+    float dpiX = renderer->GetDpiX();
+    float dpiY = renderer->GetDpiY();
+    uint32_t w = static_cast<uint32_t>(viewWidth_ * dpiX / 96.0f);
+    uint32_t h = static_cast<uint32_t>(viewHeight_ * dpiY / 96.0f);
+    if (w == 0 || h == 0) return;
 
-    // Background
-    D2D1_RECT_F barRect = D2D1::RectF(0, tabBarTop, viewWidth_, viewHeight_);
-    if (tabBarBrush_) {
-        ctx->FillRectangle(barRect, tabBarBrush_.Get());
+    if (offscreenBitmap_ && offscreenW_ == w && offscreenH_ == h) return;
+
+    offscreenBitmap_ = renderer->CreateOffscreenBitmap(w, h);
+    offscreenW_ = w;
+    offscreenH_ = h;
+}
+
+void GalleryView::EnsureGlassEffects(ID2D1DeviceContext* ctx)
+{
+    if (glassBlurEffect_) return;  // Already created
+
+    // Create Gaussian blur effect
+    ctx->CreateEffect(CLSID_D2D1GaussianBlur, &glassBlurEffect_);
+    if (glassBlurEffect_) {
+        glassBlurEffect_->SetValue(D2D1_GAUSSIANBLUR_PROP_STANDARD_DEVIATION, Theme::GlassBlurSigma);
+        glassBlurEffect_->SetValue(D2D1_GAUSSIANBLUR_PROP_BORDER_MODE, D2D1_BORDER_MODE_HARD);
     }
 
-    // Subtle top border
-    if (scrollIndicatorBrush_) {
-        D2D1_RECT_F lineRect = D2D1::RectF(0, tabBarTop, viewWidth_, tabBarTop + 0.5f);
-        ctx->FillRectangle(lineRect, scrollIndicatorBrush_.Get());
+    // Create displacement map effect
+    ctx->CreateEffect(CLSID_D2D1DisplacementMap, &glassDisplaceEffect_);
+    if (glassDisplaceEffect_) {
+        glassDisplaceEffect_->SetValue(D2D1_DISPLACEMENTMAP_PROP_SCALE, Theme::GlassDisplacementScale);
+        glassDisplaceEffect_->SetValue(D2D1_DISPLACEMENTMAP_PROP_X_CHANNEL_SELECT, D2D1_CHANNEL_SELECTOR_R);
+        glassDisplaceEffect_->SetValue(D2D1_DISPLACEMENTMAP_PROP_Y_CHANNEL_SELECT, D2D1_CHANNEL_SELECTOR_G);
     }
 
-    float halfWidth = viewWidth_ / 2.0f;
+    // Chain: content → displace → blur
+    if (glassBlurEffect_ && glassDisplaceEffect_) {
+        glassBlurEffect_->SetInputEffect(0, glassDisplaceEffect_.Get());
+    }
+}
 
-    struct TabInfo {
-        const wchar_t* label;
-        size_t labelLen;
-        GalleryTab tab;
+void GalleryView::GenerateDisplacementMap(ID2D1DeviceContext* ctx,
+                                           float width, float height, float cornerRadius)
+{
+    if (width == displacementMapW_ && height == displacementMapH_ && displacementMap_) return;
+
+    uint32_t w = static_cast<uint32_t>(std::ceil(width));
+    uint32_t h = static_cast<uint32_t>(std::ceil(height));
+    if (w == 0 || h == 0) return;
+
+    // CPU-side pixel buffer (BGRA)
+    std::vector<uint8_t> pixels(w * h * 4, 0);
+
+    float bezelWidth = 6.0f;  // Edge zone with refraction
+    float n_glass = 1.5f;     // Refractive index for Snell's law
+
+    for (uint32_t py = 0; py < h; ++py) {
+        for (uint32_t px = 0; px < w; ++px) {
+            uint8_t dx = 128;  // Neutral = no displacement
+            uint8_t dy = 128;
+
+            // Distance from nearest edge of the pill
+            float fx = static_cast<float>(px);
+            float fy = static_cast<float>(py);
+
+            // Pill shape: rounded rectangle distance
+            float cx = width * 0.5f;
+            float cy = height * 0.5f;
+            float hw = width * 0.5f - cornerRadius;
+            float hh = height * 0.5f - cornerRadius;
+
+            // Distance from rounded rect edge (approximate)
+            float edgeDistX = std::max(0.0f, std::abs(fx - cx) - hw);
+            float edgeDistY = std::max(0.0f, std::abs(fy - cy) - hh);
+            float cornerDist = std::sqrt(edgeDistX * edgeDistX + edgeDistY * edgeDistY);
+            float distFromEdge = cornerRadius - cornerDist;
+
+            // Only apply displacement in the bezel zone
+            if (distFromEdge >= 0.0f && distFromEdge < bezelWidth) {
+                float t = 1.0f - (distFromEdge / bezelWidth);  // 0=inside, 1=edge
+                // Surface normal angle based on position
+                float theta = t * 1.2f;  // Max incidence angle ~70°
+                float sinRefracted = std::sin(theta) / n_glass;
+                sinRefracted = std::clamp(sinRefracted, -1.0f, 1.0f);
+                float displacement = (std::sin(theta) - sinRefracted) * 127.0f * t;
+
+                // Direction: displace toward center
+                float dirX = 0.0f, dirY = 0.0f;
+                if (edgeDistX > 0.01f || edgeDistY > 0.01f) {
+                    float len = std::max(0.001f, std::sqrt(edgeDistX * edgeDistX + edgeDistY * edgeDistY));
+                    dirX = (fx > cx ? -1.0f : 1.0f) * edgeDistX / len;
+                    dirY = (fy > cy ? -1.0f : 1.0f) * edgeDistY / len;
+                } else {
+                    // Straight edges
+                    if (fx < bezelWidth) dirX = 1.0f;
+                    else if (fx > width - bezelWidth) dirX = -1.0f;
+                    if (fy < bezelWidth) dirY = 1.0f;
+                    else if (fy > height - bezelWidth) dirY = -1.0f;
+                }
+
+                dx = static_cast<uint8_t>(std::clamp(128.0f + displacement * dirX, 0.0f, 255.0f));
+                dy = static_cast<uint8_t>(std::clamp(128.0f + displacement * dirY, 0.0f, 255.0f));
+            }
+
+            // BGRA layout: B=dx(unused), G=dy, R=dx, A=255
+            size_t offset = (py * w + px) * 4;
+            pixels[offset + 0] = 128;  // B (unused)
+            pixels[offset + 1] = dy;   // G = Y displacement
+            pixels[offset + 2] = dx;   // R = X displacement
+            pixels[offset + 3] = 255;  // A
+        }
+    }
+
+    // Create D2D bitmap from pixel data
+    D2D1_BITMAP_PROPERTIES bitmapProps = D2D1::BitmapProperties(
+        D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM, D2D1_ALPHA_MODE_PREMULTIPLIED));
+    float dpiX, dpiY;
+    ctx->GetDpi(&dpiX, &dpiY);
+    bitmapProps.dpiX = dpiX;
+    bitmapProps.dpiY = dpiY;
+
+    displacementMap_.Reset();
+    ctx->CreateBitmap(D2D1::SizeU(w, h), pixels.data(), w * 4, bitmapProps, &displacementMap_);
+
+    displacementMapW_ = width;
+    displacementMapH_ = height;
+}
+
+void GalleryView::RenderGlassElement(ID2D1DeviceContext* ctx, ID2D1Bitmap* contentBitmap,
+                                      const D2D1_ROUNDED_RECT& pill,
+                                      ID2D1SolidColorBrush* tintBrush,
+                                      ID2D1SolidColorBrush* borderBrush)
+{
+    if (!ctx || !contentBitmap || !glassBlurEffect_) return;
+
+    auto* factory = static_cast<ID2D1Factory*>(nullptr);
+    {
+        ComPtr<ID2D1Factory> f;
+        ctx->GetFactory(&f);
+        factory = f.Get();
+        if (!factory) return;
+    }
+
+    // Create pill geometry for clipping
+    ComPtr<ID2D1RoundedRectangleGeometry> pillGeo;
+    {
+        ComPtr<ID2D1Factory> f;
+        ctx->GetFactory(&f);
+        if (!f) return;
+        f->CreateRoundedRectangleGeometry(pill, &pillGeo);
+    }
+    if (!pillGeo) return;
+
+    // Push geometry layer to clip all drawing to the pill
+    D2D1_LAYER_PARAMETERS layerParams = D2D1::LayerParameters(
+        D2D1::InfiniteRect(), pillGeo.Get());
+    ctx->PushLayer(layerParams, nullptr);
+
+    // Set up effect chain input
+    if (glassDisplaceEffect_) {
+        glassDisplaceEffect_->SetInput(0, contentBitmap);
+        if (displacementMap_) {
+            glassDisplaceEffect_->SetInput(1, displacementMap_.Get());
+        } else {
+            // Fallback: no displacement, just pass through
+            glassDisplaceEffect_->SetInput(1, contentBitmap);
+        }
+    } else if (glassBlurEffect_) {
+        glassBlurEffect_->SetInput(0, contentBitmap);
+    }
+
+    // Draw blurred content (D2D lazy-evaluates within clip region)
+    ComPtr<ID2D1Image> output;
+    glassBlurEffect_->GetOutput(&output);
+    if (output) {
+        ctx->DrawImage(output.Get());
+    }
+
+    // Dark tint overlay
+    if (tintBrush) {
+        ctx->FillRoundedRectangle(pill, tintBrush);
+    }
+
+    // Specular border
+    if (borderBrush) {
+        ctx->DrawRoundedRectangle(pill, borderBrush, 1.0f);
+    }
+
+    // Top-edge highlight (specular glint)
+    if (glassHighlightBrush_) {
+        float left = pill.rect.left + pill.radiusX;
+        float right = pill.rect.right - pill.radiusX;
+        float top = pill.rect.top + 0.5f;
+        ctx->DrawLine(D2D1::Point2F(left, top), D2D1::Point2F(right, top),
+                      glassHighlightBrush_.Get(), 0.5f);
+    }
+
+    ctx->PopLayer();
+}
+
+void GalleryView::RenderGlassTabBar(ID2D1DeviceContext* ctx, ID2D1Bitmap* contentBitmap)
+{
+    float margin = Theme::GlassTabBarMargin;
+    float barH = Theme::GlassTabBarHeight;
+    float barR = Theme::GlassTabBarCornerRadius;
+
+    // Compact centered pill (iOS 26 style) — not edge-to-edge
+    float maxBarW = 200.0f;
+    float barW = std::min(maxBarW, viewWidth_ - margin * 4.0f);
+    float barLeft = (viewWidth_ - barW) / 2.0f;
+    float barRight = barLeft + barW;
+    float barTop = viewHeight_ - barH - margin;
+    float barBottom = viewHeight_ - margin;
+
+    D2D1_ROUNDED_RECT barPill = {
+        D2D1::RectF(barLeft, barTop, barRight, barBottom),
+        barR, barR
     };
+
+    // Render the main glass bar
+    RenderGlassElement(ctx, contentBitmap, barPill, glassTintBrush_.Get(), glassBorderBrush_.Get());
+
+    // Active tab indicator pill (glass-within-glass)
+    float halfWidth = barW / 2.0f;
+    float tabT = std::clamp(tabSlide_.GetValue(), 0.0f, 1.0f);
+    float pillPadding = 4.0f;
+    float pillH = barH - pillPadding * 2.0f;
+    float pillR = pillH / 2.0f;
+
+    float activePillLeft0 = barLeft + pillPadding;
+    float activePillLeft1 = barLeft + halfWidth + pillPadding;
+    float activePillW = halfWidth - pillPadding * 2.0f;
+
+    float activePillX = activePillLeft0 + tabT * (activePillLeft1 - activePillLeft0);
+
+    D2D1_ROUNDED_RECT activePill = {
+        D2D1::RectF(activePillX, barTop + pillPadding,
+                     activePillX + activePillW, barTop + pillPadding + pillH),
+        pillR, pillR
+    };
+
+    // Active indicator: lighter glass fill
+    {
+        ComPtr<ID2D1RoundedRectangleGeometry> activePillGeo;
+        ComPtr<ID2D1Factory> f;
+        ctx->GetFactory(&f);
+        if (f) f->CreateRoundedRectangleGeometry(activePill, &activePillGeo);
+        if (activePillGeo) {
+            D2D1_LAYER_PARAMETERS layerParams = D2D1::LayerParameters(
+                D2D1::InfiniteRect(), activePillGeo.Get());
+            ctx->PushLayer(layerParams, nullptr);
+
+            // Draw blurred content through active pill
+            if (glassBlurEffect_) {
+                ComPtr<ID2D1Image> output;
+                glassBlurEffect_->GetOutput(&output);
+                if (output) ctx->DrawImage(output.Get());
+            }
+
+            if (glassActivePillBrush_)
+                ctx->FillRoundedRectangle(activePill, glassActivePillBrush_.Get());
+            if (glassActivePillBorderBrush_)
+                ctx->DrawRoundedRectangle(activePill, glassActivePillBorderBrush_.Get(), 1.0f);
+
+            ctx->PopLayer();
+        }
+    }
+
+    // Draw tab labels
+    struct TabInfo { const wchar_t* label; size_t labelLen; GalleryTab tab; };
     TabInfo tabs[] = {
         {L"\u7167\u7247", 2, GalleryTab::Photos},
         {L"\u76F8\u518C", 2, GalleryTab::Albums},
     };
 
-    // Animated tab indicator
-    if (accentBrush_) {
-        float indicatorW = 28.0f;
-        float pos0 = halfWidth * 0.5f - indicatorW * 0.5f;
-        float pos1 = halfWidth + halfWidth * 0.5f - indicatorW * 0.5f;
-        float tabT = std::clamp(tabSlide_.GetValue(), 0.0f, 1.0f);
-        float indicatorX = pos0 + tabT * (pos1 - pos0);
-        D2D1_ROUNDED_RECT indicator = {
-            D2D1::RectF(indicatorX, tabBarTop + 4.0f,
-                         indicatorX + indicatorW, tabBarTop + 6.5f),
-            1.25f, 1.25f
-        };
-        ctx->FillRoundedRectangle(indicator, accentBrush_.Get());
-    }
-
     for (int t = 0; t < 2; ++t) {
-        float tabX = t * halfWidth;
+        float tabLeft = barLeft + t * halfWidth;
+        float tabRight = tabLeft + halfWidth;
         bool isActive = (activeTab_ == tabs[t].tab);
 
-        // Label
-        D2D1_RECT_F tabRect = D2D1::RectF(tabX, tabBarTop + 8.0f,
-                                            tabX + halfWidth, viewHeight_ - 4.0f);
+        D2D1_RECT_F tabRect = D2D1::RectF(tabLeft, barTop, tabRight, barBottom);
 
         if (tabFormat_) {
-            auto* brush = isActive ? accentBrush_.Get() : secondaryBrush_.Get();
+            auto* brush = isActive ? glassTabTextBrush_.Get() : glassTabTextInactiveBrush_.Get();
             if (brush) {
                 ctx->DrawText(tabs[t].label, static_cast<UINT32>(tabs[t].labelLen),
                               tabFormat_.Get(), tabRect, brush);
             }
         }
+    }
+}
+
+void GalleryView::RenderGlassBackButton(ID2D1DeviceContext* ctx, ID2D1Bitmap* contentBitmap)
+{
+    if (!backButtonFormat_ || !dwFactory_) return;
+
+    // Measure text width for auto-sizing
+    const wchar_t* text = L"\u2039 \u76F8\u518C";
+    uint32_t textLen = 4;
+    float maxW = 200.0f;
+    float btnH = Theme::GlassBackBtnHeight;
+
+    ComPtr<IDWriteTextLayout> layout;
+    HRESULT hr = dwFactory_->CreateTextLayout(text, textLen, backButtonFormat_.Get(),
+                                               maxW, btnH, &layout);
+    if (FAILED(hr) || !layout) return;
+
+    DWRITE_TEXT_METRICS metrics;
+    layout->GetMetrics(&metrics);
+
+    float btnW = metrics.width + Theme::GlassBackBtnPadding * 2.0f;
+    float btnR = btnH / 2.0f;
+    float btnX = Theme::GlassTabBarMargin;
+    float btnY = Theme::GlassTabBarMargin;
+
+    D2D1_ROUNDED_RECT btnPill = {
+        D2D1::RectF(btnX, btnY, btnX + btnW, btnY + btnH),
+        btnR, btnR
+    };
+
+    RenderGlassElement(ctx, contentBitmap, btnPill, glassTintBrush_.Get(), glassBorderBrush_.Get());
+
+    // Draw text centered in pill
+    if (glassTabTextBrush_) {
+        D2D1_RECT_F textRect = D2D1::RectF(
+            btnX + Theme::GlassBackBtnPadding, btnY,
+            btnX + btnW - Theme::GlassBackBtnPadding, btnY + btnH);
+        ctx->DrawText(text, textLen, backButtonFormat_.Get(), textRect, glassTabTextBrush_.Get());
     }
 }
 
@@ -1233,15 +1528,23 @@ void GalleryView::OnMouseUp(float x, float y)
     }
 
     if (!hasDragged_) {
-        // Tab bar (always clickable, even during transition)
-        float tabBarTop = viewHeight_ - Theme::TabBarHeight;
-        if (y >= tabBarTop && y <= viewHeight_) {
-            float halfWidth = viewWidth_ / 2.0f;
-            if (x < halfWidth) {
+        // Glass tab bar hit test (compact centered pill at bottom)
+        float margin = Theme::GlassTabBarMargin;
+        float barH = Theme::GlassTabBarHeight;
+        float maxBarW = 200.0f;
+        float barW = std::min(maxBarW, viewWidth_ - margin * 4.0f);
+        float barLeft = (viewWidth_ - barW) / 2.0f;
+        float barRight = barLeft + barW;
+        float barTop = viewHeight_ - barH - margin;
+        float barBottom = viewHeight_ - margin;
+
+        if (y >= barTop && y <= barBottom && x >= barLeft && x <= barRight) {
+            float halfWidth = barW / 2.0f;
+            float relX = x - barLeft;
+            if (relX < halfWidth) {
                 activeTab_ = GalleryTab::Photos;
                 tabSlide_.SetTarget(0.0f);
                 if (inFolderDetail_) {
-                    // Instant exit when switching tabs (no animation)
                     inFolderDetail_ = false;
                     folderTransitionActive_ = false;
                     folderDetailImages_.clear();
@@ -1261,12 +1564,12 @@ void GalleryView::OnMouseUp(float x, float y)
             return;
         }
 
-        // Back button in folder detail — "< 相册" text area
+        // Glass back button in folder detail
         if (activeTab_ == GalleryTab::Albums && inFolderDetail_) {
-            float btnX = Theme::GalleryPadding;
-            float btnY = 6.0f;
-            float btnW = 80.0f;
-            float btnH = 32.0f;
+            float btnX = Theme::GlassTabBarMargin;
+            float btnY = Theme::GlassTabBarMargin;
+            float btnW = 100.0f;  // Generous hit area
+            float btnH = Theme::GlassBackBtnHeight;
             if (x >= btnX && x <= btnX + btnW && y >= btnY && y <= btnY + btnH) {
                 ExitFolderDetail();
                 consumedClick_ = true;
@@ -1301,8 +1604,9 @@ void GalleryView::OnMouseUp(float x, float y)
 
 std::optional<GalleryView::HitResult> GalleryView::HitTest(float x, float y) const
 {
-    float tabBarTop = viewHeight_ - Theme::TabBarHeight;
-    if (y >= tabBarTop) return std::nullopt;
+    // Reject clicks in the glass tab bar region
+    float glassBarTop = viewHeight_ - Theme::GlassTabBarHeight - Theme::GlassTabBarMargin;
+    if (y >= glassBarTop) return std::nullopt;
     if (activeTab_ == GalleryTab::Albums && !inFolderDetail_) return std::nullopt;
 
     auto grid = CalculateGridLayout(viewWidth_);

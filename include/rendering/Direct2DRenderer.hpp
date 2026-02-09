@@ -80,6 +80,10 @@ public:
     ID2D1DeviceContext* GetContext() const { return context_.Get(); }
     ID2D1Factory3* GetFactory() const { return factory_.Get(); }
 
+    // Offscreen bitmap for glass effects (render content → read back for blur)
+    ComPtr<ID2D1Bitmap1> CreateOffscreenBitmap(uint32_t w, uint32_t h);
+    ID2D1Bitmap1* GetRenderTarget() const { return renderTarget_.Get(); }
+
     // Resources
     ComPtr<ID2D1SolidColorBrush> CreateBrush(const D2D1_COLOR_F& color);
     ComPtr<IDWriteTextFormat> CreateTextFormat(
