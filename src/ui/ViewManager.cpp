@@ -110,7 +110,7 @@ void ViewManager::TransitionToViewer(size_t imageIndex, D2D1_RECT_F fromRect)
 {
     if (state_ != ViewState::Gallery) return;
 
-    auto& images = galleryView_.GetImages();
+    auto& images = galleryView_.GetActiveImages();
     if (imageIndex >= images.size()) return;
 
     // Set up viewer — "lift" the thumbnail from gallery
@@ -238,8 +238,8 @@ void ViewManager::OnMouseUp(float x, float y)
     switch (state_) {
         case ViewState::Gallery: {
             galleryView_.OnMouseUp(x, y);
-            // Check if a cell was clicked (not dragged)
-            if (!galleryView_.WasDragging()) {
+            // Check if a cell was clicked (not dragged, and not consumed by tab/album/back)
+            if (!galleryView_.WasDragging() && !galleryView_.ConsumedClick()) {
                 auto hit = galleryView_.HitTest(x, y);
                 if (hit.has_value()) {
                     TransitionToViewer(hit->index, hit->rect);

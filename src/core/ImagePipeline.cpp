@@ -172,10 +172,13 @@ std::vector<std::filesystem::path> ImagePipeline::ScanDirectory(const std::files
 std::vector<ScannedImage> ImagePipeline::ScanFolders(
     const std::vector<std::filesystem::path>& folders,
     std::atomic<bool>& cancelFlag,
-    std::atomic<size_t>& outCount)
+    std::atomic<size_t>& outCount,
+    ScanFlushCallback flushCallback)
 {
     std::vector<ScannedImage> result;
     std::unordered_set<std::wstring> seen;
+    size_t lastFlushCount = 0;
+    constexpr size_t kFlushInterval = 200;
 
     static const std::set<std::wstring> supportedExts = {
         L".jpg", L".jpeg", L".png", L".bmp", L".gif",
@@ -185,11 +188,49 @@ std::vector<ScannedImage> ImagePipeline::ScanFolders(
 
     // Folder names to skip during recursive scan
     static const std::set<std::wstring> skipDirs = {
-        L"node_modules", L"AppData", L".git", L".svn",
-        L"Temp", L"Cache", L"cache", L"$RECYCLE.BIN",
-        L"System Volume Information", L"__pycache__",
-        L".vs", L".vscode", L"Debug", L"Release",
-        L"x64", L"x86", L"obj", L"bin"
+        // VCS / dev tooling
+        L".git", L".svn", L".hg", L".vs", L".vscode", L".idea",
+        L"node_modules", L"__pycache__", L".tox", L".mypy_cache",
+        // Build artifacts
+        L"Debug", L"Release", L"x64", L"x86", L"obj", L"bin",
+        L"build", L"out", L"dist", L"target",
+        // System / temp
+        L"AppData", L"Temp", L"tmp",
+        L"Cache", L"cache", L"CachedData",
+        L"$RECYCLE.BIN", L"System Volume Information",
+        // Icons / thumbnails / UI assets
+        L"icons", L"icon", L"ico",
+        L"thumbnails", L"thumbnail", L"thumb", L"thumbs",
+        L"assets", L"Resources", L"resource", L"res",
+        L"sprites", L"textures", L"drawable", L"drawable-hdpi",
+        L"drawable-mdpi", L"drawable-xhdpi", L"drawable-xxhdpi",
+        L"favicon", L"favicons", L"emoji", L"emojis", L"stickers",
+        // Fonts / cursors
+        L"fonts", L"font", L"cursors",
+        // Package / library internals
+        L"vendor", L"packages", L"lib", L"libs",
+        L".nuget", L".npm", L".yarn",
+        // Windows special
+        L"Windows", L"ProgramData",
+        L"Program Files", L"Program Files (x86)",
+    };
+
+    // Minimum file size to include (filter out icons, favicons, UI assets)
+    constexpr ULONGLONG kMinImageSize = 100 * 1024;  // 100KB
+
+    // Helper: sort current results and invoke flush callback
+    auto doFlush = [&]() {
+        if (!flushCallback) return;
+        // Sort a copy for the callback (main result stays unsorted until final)
+        auto sorted = result;
+        std::sort(sorted.begin(), sorted.end(),
+            [](const ScannedImage& a, const ScannedImage& b) {
+                if (a.year != b.year) return a.year > b.year;
+                if (a.month != b.month) return a.month > b.month;
+                return a.path.filename() < b.path.filename();
+            });
+        flushCallback(sorted);
+        lastFlushCount = result.size();
     };
 
     for (const auto& dir : folders) {
@@ -242,14 +283,28 @@ std::vector<ScannedImage> ImagePipeline::ScanFolders(
                             WIN32_FILE_ATTRIBUTE_DATA fad;
                             if (GetFileAttributesExW(img.path.c_str(),
                                                       GetFileExInfoStandard, &fad)) {
+                                // Check file size — skip small files (icons, favicons, etc.)
+                                ULONGLONG fileSize = (static_cast<ULONGLONG>(fad.nFileSizeHigh) << 32) | fad.nFileSizeLow;
+                                if (fileSize < kMinImageSize) {
+                                    std::error_code iterEc;
+                                    it.increment(iterEc);
+                                    continue;
+                                }
+
                                 SYSTEMTIME st;
                                 FileTimeToSystemTime(&fad.ftLastWriteTime, &st);
                                 img.year = st.wYear;
                                 img.month = st.wMonth;
                             }
 
+                            img.sourceFolder = dir;
                             result.push_back(std::move(img));
                             outCount = result.size();
+
+                            // Flush every kFlushInterval new images
+                            if (result.size() - lastFlushCount >= kFlushInterval) {
+                                doFlush();
+                            }
                         }
                     }
                 }
@@ -261,6 +316,11 @@ std::vector<ScannedImage> ImagePipeline::ScanFolders(
                 std::error_code iterEc;
                 it.increment(iterEc);
             }
+        }
+
+        // Flush after each top-level folder (if new images were added)
+        if (!cancelFlag && result.size() > lastFlushCount) {
+            doFlush();
         }
     }
 
@@ -306,7 +366,7 @@ std::vector<ScannedImage> ImagePipeline::ScanSystemImages(
         }
     }
 
-    return ScanFolders(folders, cancelFlag, outCount);
+    return ScanFolders(folders, cancelFlag, outCount, nullptr);
 }
 
 bool ImagePipeline::HasThumbnail(const std::filesystem::path& path) const

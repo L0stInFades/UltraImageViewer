@@ -82,7 +82,6 @@ private:
 
     // Album folders
     void AddAlbumFolder();
-    void StartAlbumScan();
     void LoadAlbumFolders();
     void SaveAlbumFolders();
     std::filesystem::path GetAlbumFilePath() const;
@@ -148,7 +147,7 @@ private:
     std::vector<ScannedImage> scannedResults_;
     size_t lastGalleryUpdateCount_ = 0;
 
-    void StartSystemScan();
+    void StartFullScan();
     void CheckScanProgress();
 };
 

@@ -21,6 +21,7 @@ namespace Core {
 
 struct ScannedImage {
     std::filesystem::path path;
+    std::filesystem::path sourceFolder;  // Top-level scan folder this image came from
     int year = 0;
     int month = 0;
 };
@@ -50,10 +51,15 @@ public:
     static std::vector<std::filesystem::path> ScanDirectory(const std::filesystem::path& dir);
 
     // Scan arbitrary folders recursively for images (with date grouping)
+    // Optional flushCallback is invoked periodically with sorted intermediate results
+    // (every 200 images or after each top-level folder).
+    using ScanFlushCallback = std::function<void(const std::vector<ScannedImage>&)>;
+
     static std::vector<ScannedImage> ScanFolders(
         const std::vector<std::filesystem::path>& folders,
         std::atomic<bool>& cancelFlag,
-        std::atomic<size_t>& outCount);
+        std::atomic<size_t>& outCount,
+        ScanFlushCallback flushCallback = nullptr);
 
     // Scan system image folders (Pictures, Desktop, Downloads) recursively
     static std::vector<ScannedImage> ScanSystemImages(

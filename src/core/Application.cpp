@@ -13,6 +13,7 @@
 #include <knownfolders.h>
 #include <fstream>
 #include <sstream>
+#include <set>
 #include <wrl/client.h>
 
 #pragma comment(lib, "shcore.lib")
@@ -129,14 +130,10 @@ int Application::Run(int nCmdShow)
     ShowWindow(hwnd_, nCmdShow);
     UpdateWindow(hwnd_);
 
-    // Auto-scan: prefer saved album folders, fall back to system defaults
+    // Auto-scan: merge album folders + system defaults, progressive display
     if (currentImages_.empty()) {
         LoadAlbumFolders();
-        if (!albumFolders_.empty()) {
-            StartAlbumScan();
-        } else {
-            StartSystemScan();
-        }
+        StartFullScan();
     }
 
     QueryPerformanceFrequency(&perfFrequency_);
@@ -193,9 +190,9 @@ int Application::Run(int nCmdShow)
     return static_cast<int>(msg.wParam);
 }
 
-void Application::StartSystemScan()
+void Application::StartFullScan()
 {
-    DebugLog("Starting system image scan...");
+    DebugLog("Starting full scan (album + system folders)...");
     isScanning_ = true;
     scanCancelled_ = false;
     scanProgress_ = 0;
@@ -207,15 +204,56 @@ void Application::StartSystemScan()
         viewManager_->GetGalleryView()->SetScanningState(true, 0);
     }
 
-    scanThread_ = std::jthread([this](std::stop_token) {
+    // Merge folder lists: album folders + system known folders
+    auto folders = albumFolders_;  // copy
+
+    // Append system known folders
+    for (const auto& id : {FOLDERID_Pictures, FOLDERID_Desktop, FOLDERID_Downloads,
+                            FOLDERID_CameraRoll, FOLDERID_SavedPictures}) {
+        PWSTR p = nullptr;
+        if (SUCCEEDED(SHGetKnownFolderPath(id, 0, nullptr, &p))) {
+            folders.emplace_back(p);
+            CoTaskMemFree(p);
+        }
+    }
+
+    // Deduplicate by canonical path
+    {
+        std::vector<std::filesystem::path> unique;
+        std::set<std::wstring> seen;
+        for (auto& f : folders) {
+            std::error_code ec;
+            auto canonical = std::filesystem::canonical(f, ec);
+            if (ec) canonical = f;  // fallback if canonical fails
+            std::wstring key = canonical.wstring();
+            std::transform(key.begin(), key.end(), key.begin(), ::towlower);
+            if (!seen.contains(key)) {
+                seen.insert(key);
+                unique.push_back(std::move(f));
+            }
+        }
+        folders = std::move(unique);
+    }
+
+    DebugLog(("Full scan: " + std::to_string(folders.size()) + " folders").c_str());
+
+    scanThread_ = std::jthread([this, folders = std::move(folders)](std::stop_token) {
         // COM must be initialized on this thread for SHGetKnownFolderPath
         CoInitializeEx(nullptr, COINIT_MULTITHREADED);
 
         try {
-            auto results = ImagePipeline::ScanSystemImages(scanCancelled_, scanProgress_);
+            auto flushCallback = [this](const std::vector<ScannedImage>& current) {
+                std::lock_guard lock(scanMutex_);
+                scannedResults_ = current;  // snapshot sorted intermediate results
+                scanDirty_ = true;
+            };
+
+            auto results = ImagePipeline::ScanFolders(
+                folders, scanCancelled_, scanProgress_, flushCallback);
 
             DebugLog(("Scan found " + std::to_string(results.size()) + " images").c_str());
 
+            // Final results (already sorted by ScanFolders)
             {
                 std::lock_guard lock(scanMutex_);
                 scannedResults_ = std::move(results);
@@ -240,12 +278,11 @@ void Application::CheckScanProgress()
 
     // Update scanning state display (progress count)
     if (isScanning_) {
-        size_t count = scanProgress_.load();
-        gallery->SetScanningState(true, count);
+        gallery->SetScanningState(true, scanProgress_.load());
         needsRender_ = true;
     }
 
-    // Check if scan has delivered new results
+    // Check if scan has delivered new results (intermediate flush or final)
     if (scanDirty_.exchange(false)) {
         std::vector<ScannedImage> results;
         {
@@ -253,7 +290,11 @@ void Application::CheckScanProgress()
             results = scannedResults_;
         }
 
-        gallery->SetScanningState(false, results.size());
+        // Only close scanning state when scan is actually finished
+        if (!isScanning_) {
+            gallery->SetScanningState(false, results.size());
+        }
+
         gallery->SetImagesGrouped(results);
 
         // Update flat image list for viewer compatibility
@@ -269,7 +310,6 @@ void Application::CheckScanProgress()
         SetWindowTextW(hwnd_, title.c_str());
 
         needsRender_ = true;
-        DebugLog("Scan results pushed to gallery");
     }
 }
 
@@ -881,7 +921,7 @@ void Application::AddAlbumFolder()
 
     DebugLog(("Added album folder: " + folder.string()).c_str());
 
-    // Cancel current scan and rescan all album folders
+    // Cancel current scan and rescan all sources
     if (isScanning_) {
         scanCancelled_ = true;
         if (scanThread_.joinable()) {
@@ -891,48 +931,9 @@ void Application::AddAlbumFolder()
         isScanning_ = false;
     }
 
-    StartAlbumScan();
+    StartFullScan();
 }
 
-void Application::StartAlbumScan()
-{
-    DebugLog("Starting album folder scan...");
-    isScanning_ = true;
-    scanCancelled_ = false;
-    scanProgress_ = 0;
-    scanDirty_ = false;
-    lastGalleryUpdateCount_ = 0;
-
-    if (viewManager_) {
-        viewManager_->GetGalleryView()->SetScanningState(true, 0);
-    }
-
-    // Capture a copy of the folder list for the thread
-    auto folders = albumFolders_;
-
-    scanThread_ = std::jthread([this, folders = std::move(folders)](std::stop_token) {
-        CoInitializeEx(nullptr, COINIT_MULTITHREADED);
-
-        try {
-            auto results = ImagePipeline::ScanFolders(folders, scanCancelled_, scanProgress_);
-
-            DebugLog(("Album scan found " + std::to_string(results.size()) + " images").c_str());
-
-            {
-                std::lock_guard lock(scanMutex_);
-                scannedResults_ = std::move(results);
-            }
-            scanDirty_ = true;
-        } catch (const std::exception& e) {
-            DebugLog(("Album scan exception: " + std::string(e.what())).c_str());
-        } catch (...) {
-            DebugLog("Album scan unknown exception");
-        }
-
-        isScanning_ = false;
-        CoUninitialize();
-    });
-}
 
 } // namespace Core
 } // namespace UltraImageViewer
