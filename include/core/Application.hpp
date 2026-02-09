@@ -101,7 +101,7 @@ private:
     HWND hwnd_ = nullptr;
 
     // Window state
-    std::wstring windowTitle_ = L"\u62FE\u5149 Sh\u00EDgu\u0101ng";
+    std::wstring windowTitle_ = L"\u62FE\u5149 Afterglow";
     UINT windowWidth_ = 1280;
     UINT windowHeight_ = 720;
     float dpiScale_ = 1.0f;
