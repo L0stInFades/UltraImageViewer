@@ -321,6 +321,15 @@ void GalleryView::EnterFolderDetail(size_t albumIndex)
     folderDetailScrollY_.SnapToTarget();
     folderDetailMaxScroll_ = 0.0f;
 
+    // Pre-warm decode pipeline: request first batch of thumbnails so they're
+    // decoding during the ~300ms slide animation and ready when it ends
+    if (pipeline_) {
+        size_t preload = std::min(folderDetailImages_.size(), size_t(40));
+        for (size_t i = 0; i < preload; ++i) {
+            pipeline_->RequestThumbnail(folderDetailImages_[i], Theme::ThumbnailMaxPx);
+        }
+    }
+
     // Start navigation push animation
     folderSlide_.SetValue(0.0f);
     folderSlide_.SetTarget(1.0f);
@@ -560,6 +569,11 @@ void GalleryView::Render(Rendering::Direct2DRenderer* renderer)
         if (folderTransitionActive_) {
             float t = std::clamp(folderSlide_.GetValue(), 0.0f, 1.0f);
 
+            // Suppress synchronous GPU uploads + decode requests during transition:
+            // only show already-in-memory thumbnails for both views (same as fast scroll)
+            bool savedFastScroll = isFastScrolling_;
+            isFastScrolling_ = true;
+
             D2D1_MATRIX_3X2_F savedTransform;
             ctx->GetTransform(&savedTransform);
 
@@ -582,6 +596,7 @@ void GalleryView::Render(Rendering::Direct2DRenderer* renderer)
             }
 
             ctx->SetTransform(savedTransform);
+            isFastScrolling_ = savedFastScroll;
         } else if (inFolderDetail_) {
             RenderFolderDetail(renderer, ctx, viewHeight_);
         } else {
@@ -983,12 +998,17 @@ void GalleryView::RenderAlbumsTab(Rendering::Direct2DRenderer* renderer,
             ctx->FillRoundedRectangle(roundedImg, cellBrush_.Get());
         }
 
-        uint32_t albumTargetPx = std::min(
-            static_cast<uint32_t>(ag.cardWidth * (renderer ? renderer->GetDpiX() / 96.0f : 1.0f)),
-            Theme::ThumbnailMaxPx);
-        auto thumbnail = pipeline_
-            ? pipeline_->RequestThumbnail(folderAlbums_[i].coverImage, albumTargetPx)
-            : nullptr;
+        Microsoft::WRL::ComPtr<ID2D1Bitmap> thumbnail;
+        if (pipeline_) {
+            if (isFastScrolling_) {
+                thumbnail = pipeline_->GetCachedThumbnail(folderAlbums_[i].coverImage);
+            } else {
+                uint32_t albumTargetPx = std::min(
+                    static_cast<uint32_t>(ag.cardWidth * (renderer ? renderer->GetDpiX() / 96.0f : 1.0f)),
+                    Theme::ThumbnailMaxPx);
+                thumbnail = pipeline_->RequestThumbnail(folderAlbums_[i].coverImage, albumTargetPx);
+            }
+        }
         if (thumbnail) {
             D2D1_RECT_F srcRect = ComputeCropRect(thumbnail.Get(), ag.cardWidth, ag.imageHeight);
             DrawBitmapRounded(ctx, factory, thumbnail.Get(), imgRect, cornerRadius, &srcRect);
