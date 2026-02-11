@@ -142,6 +142,7 @@ private:
     bool needsRender_ = true;
     LARGE_INTEGER lastFrameTime_ = {};
     LARGE_INTEGER perfFrequency_ = {};
+    LARGE_INTEGER lastScanRender_ = {};  // 60fps throttle for scan animation
 
     // Singleton
     static Application* s_instance;
@@ -158,6 +159,7 @@ private:
     mutable std::mutex scanMutex_;
     std::vector<ScannedImage> scannedResults_;
     size_t lastGalleryUpdateCount_ = 0;
+    size_t lastDisplayedScanCount_ = 0;  // Avoid redundant SetScanningState calls
 
     void StartFullScan();
     void CheckScanProgress();
@@ -171,7 +173,8 @@ private:
     void SaveScanCache(const std::vector<ScannedImage>& results);
     std::vector<ScannedImage> LoadScanCache();
 
-    // Persistent thumbnail cache (background save)
+    // Persistent thumbnail cache (background load/save)
+    std::jthread persistLoadThread_;
     std::jthread thumbSaveThread_;
     std::atomic<bool> thumbSaveDone_{true};
 

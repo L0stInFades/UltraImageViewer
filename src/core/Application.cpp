@@ -91,6 +91,11 @@ void Application::Shutdown()
     SaveAlbumFolders();
     SaveFolderProfiles();
 
+    // Wait for any in-flight persistent thumbnail load
+    if (persistLoadThread_.joinable()) {
+        persistLoadThread_.join();
+    }
+
     // Wait for any in-flight persistent thumbnail save
     if (thumbSaveThread_.joinable()) {
         thumbSaveThread_.join();
@@ -148,10 +153,12 @@ int Application::Run(int nCmdShow)
         LoadHiddenAlbums();
         LoadFolderProfiles();
 
-        // Load persistent thumbnail cache (memory-mapped for instant pixel access)
+        // Load persistent thumbnail cache asynchronously (non-blocking first frame)
         if (pipeline_) {
             auto thumbPath = GetScanCachePath().parent_path() / L"scan_thumbs.bin";
-            pipeline_->LoadPersistentThumbs(thumbPath);
+            persistLoadThread_ = std::jthread([this, thumbPath](std::stop_token) {
+                pipeline_->LoadPersistentThumbs(thumbPath);
+            });
         }
 
         // Load cached scan results for instant display
@@ -213,7 +220,20 @@ int Application::Run(int nCmdShow)
         bool hasAnimations = animEngine_ && animEngine_->HasActiveAnimations();
         bool viewNeedsRender = viewManager_ && viewManager_->NeedsRender();
 
-        if (needsRender_ || hasAnimations || viewNeedsRender || isScanning_) {
+        // Scanning: throttle to ~60fps for the blue bar animation instead of 100% CPU spin
+        bool scanAnimFrame = false;
+        if (isScanning_) {
+            LARGE_INTEGER scanNow;
+            QueryPerformanceCounter(&scanNow);
+            double msSinceLast = static_cast<double>(scanNow.QuadPart - lastScanRender_.QuadPart)
+                                 / static_cast<double>(perfFrequency_.QuadPart) * 1000.0;
+            if (msSinceLast >= 16.0) {
+                scanAnimFrame = true;
+                lastScanRender_ = scanNow;
+            }
+        }
+
+        if (needsRender_ || hasAnimations || viewNeedsRender || scanAnimFrame) {
             try {
                 Render();
             } catch (const std::exception& e) {
@@ -238,6 +258,7 @@ void Application::StartFullScan()
     scanProgress_ = 0;
     scanDirty_ = false;
     lastGalleryUpdateCount_ = 0;
+    lastDisplayedScanCount_ = 0;
 
     // Update gallery scanning state
     if (viewManager_) {
@@ -302,15 +323,13 @@ void Application::StartFullScan()
         // COM must be initialized on this thread for SHGetKnownFolderPath
         CoInitializeEx(nullptr, COINIT_MULTITHREADED);
 
-        try {
-            auto flushCallback = [this](const std::vector<ScannedImage>& current) {
-                std::lock_guard lock(scanMutex_);
-                scannedResults_ = current;  // snapshot sorted intermediate results
-                scanDirty_ = true;
-            };
+        // Lower scan thread priority so rendering stays smooth
+        SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
 
+        try {
+            // No intermediate flush — gallery is frozen during scan, one-shot rebuild at end
             auto results = ImagePipeline::ScanFolders(
-                folders, scanCancelled_, scanProgress_, flushCallback);
+                folders, scanCancelled_, scanProgress_, nullptr);
 
             DebugLog(("Scan found " + std::to_string(results.size()) + " images").c_str());
 
@@ -341,56 +360,59 @@ void Application::CheckScanProgress()
 
     auto* gallery = viewManager_->GetGalleryView();
 
-    // Update scanning state display (progress count)
+    // --- During scan: only update the progress counter for the blue bar animation ---
     if (isScanning_) {
-        gallery->SetScanningState(true, scanProgress_.load());
-        needsRender_ = true;
+        size_t current = scanProgress_.load();
+        if (current != lastDisplayedScanCount_) {
+            gallery->SetScanningState(true, current);
+            lastDisplayedScanCount_ = current;
+            needsRender_ = true;
+        }
+        return;  // Do NOT touch gallery data until scan completes
     }
 
-    // Check if scan has delivered new results (intermediate flush or final)
+    // --- ONE-SHOT rebuild when scan finishes ---
     if (scanDirty_.exchange(false)) {
         std::vector<ScannedImage> results;
         {
             std::lock_guard lock(scanMutex_);
-            results = scannedResults_;
+            results = std::move(scannedResults_);
         }
 
         // Filter out user-hidden albums before display
         FilterHiddenAlbums(results);
 
-        // Only close scanning state when scan is actually finished
-        if (!isScanning_) {
-            gallery->SetScanningState(false, results.size());
-            SaveScanCache(results);  // Persist filtered paths for next launch
+        gallery->SetScanningState(false, results.size());
+        SaveScanCache(results);  // Persist filtered paths for next launch
 
-            // Auto-clear manual open when scan completes (gallery is fully restored)
-            inManualOpen_ = false;
-            gallery->SetManualOpenMode(false);
+        // Auto-clear manual open when scan completes (gallery is fully restored)
+        inManualOpen_ = false;
+        gallery->SetManualOpenMode(false);
 
-            // Save persistent thumbnail cache in background thread (non-blocking)
-            if (pipeline_) {
-                auto thumbPath = GetScanCachePath().parent_path() / L"scan_thumbs.bin";
-                if (thumbSaveThread_.joinable()) {
-                    if (thumbSaveDone_.load()) {
-                        thumbSaveThread_.join();
-                    } else {
-                        // Previous save still running — skip this time; shutdown will join
-                        goto skipThumbSave;
-                    }
+        // Save persistent thumbnail cache in background thread (non-blocking)
+        if (pipeline_) {
+            auto thumbPath = GetScanCachePath().parent_path() / L"scan_thumbs.bin";
+            if (thumbSaveThread_.joinable()) {
+                if (thumbSaveDone_.load()) {
+                    thumbSaveThread_.join();
+                } else {
+                    // Previous save still running — skip this time; shutdown will join
+                    goto skipThumbSave;
                 }
-                thumbSaveDone_ = false;
-                thumbSaveThread_ = std::jthread([this, thumbPath](std::stop_token) {
-                    pipeline_->SavePersistentThumbs(thumbPath);
-                    thumbSaveDone_ = true;
-                });
-                skipThumbSave:;
             }
+            thumbSaveDone_ = false;
+            thumbSaveThread_ = std::jthread([this, thumbPath](std::stop_token) {
+                pipeline_->SavePersistentThumbs(thumbPath);
+                thumbSaveDone_ = true;
+            });
+            skipThumbSave:;
         }
 
         gallery->SetImagesGrouped(results);
 
         // Update flat image list for viewer compatibility
         currentImages_.clear();
+        currentImages_.reserve(results.size());
         for (const auto& img : results) {
             currentImages_.push_back(img.path);
         }

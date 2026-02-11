@@ -220,6 +220,7 @@ private:
     // Scanning state
     bool isScanning_ = false;
     size_t scanCount_ = 0;
+    float scanBarPhase_ = 0.0f;  // Sinusoidal sweep phase [0, 1)
 
     // Rendering resources
     Microsoft::WRL::ComPtr<ID2D1SolidColorBrush> bgBrush_;

@@ -893,10 +893,11 @@ void GalleryView::RenderPhotosTab(Rendering::Direct2DRenderer* renderer,
         }
     }
 
-    // Scanning progress
+    // Scanning progress — smooth sinusoidal ease-in-out sweep
     if (isScanning_ && accentBrush_) {
         float barY = Theme::GalleryHeaderHeight - 2.0f;
-        float progress = std::fmod(static_cast<float>(scanCount_) * 0.01f, 1.0f);
+        float t = scanBarPhase_;
+        float progress = 0.5f - 0.5f * std::cos(t * 2.0f * 3.14159265f);
         float barWidth = viewWidth_ * 0.3f;
         float barX = progress * (viewWidth_ - barWidth);
         D2D1_ROUNDED_RECT progressBar = {
@@ -1695,6 +1696,14 @@ void GalleryView::Update(float deltaTime)
     tabSlide_.Update(deltaTime);
     editBadgeScale_.Update(deltaTime);
     deleteCardScale_.Update(deltaTime);
+
+    // Scan bar phase accumulation (smooth sinusoidal sweep)
+    if (isScanning_) {
+        scanBarPhase_ += deltaTime * 0.8f;  // ~0.8 cycles/sec
+        if (scanBarPhase_ > 1.0f) scanBarPhase_ -= 1.0f;
+    } else {
+        scanBarPhase_ = 0.0f;
+    }
 
     // Edit mode time accumulator
     if (editMode_ || !editBadgeScale_.IsFinished()) {
