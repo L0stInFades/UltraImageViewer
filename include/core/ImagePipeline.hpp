@@ -111,8 +111,29 @@ private:
     void ThumbnailDecodeTask(const std::filesystem::path& path,
                              uint32_t targetSize, uint64_t generation);
 
-    // LRU eviction for thumbnail cache
+    // LRU eviction for thumbnail cache (demotes to Tier 2 compressed cache)
     void EvictThumbnailsIfNeeded();
+
+    // --- Tier 2: CPU-RAM compressed pixel cache ---
+    // Evicted GPU bitmaps are compressed and kept in RAM. On re-request,
+    // decompressing from RAM (~0.3ms) is much faster than re-reading from
+    // disk and decoding JPEG (~5ms).
+    struct CompressedThumbnail {
+        std::unique_ptr<uint8_t[]> data;
+        size_t compressedSize = 0;
+        uint32_t rawSize = 0;  // uncompressed BGRA size
+        uint16_t width = 0;
+        uint16_t height = 0;
+    };
+    std::unordered_map<std::filesystem::path, CompressedThumbnail> tier2Cache_;
+    size_t tier2Bytes_ = 0;  // total compressed bytes
+    static constexpr size_t kTier2MaxBytes = 256ULL * 1024 * 1024;  // 256MB compressed
+
+    // Compress/decompress helpers (Windows Compression API: XPRESS + Huffman)
+    static bool CompressPixels(const uint8_t* src, uint32_t srcSize,
+                               std::unique_ptr<uint8_t[]>& outBuf, size_t& outSize);
+    static bool DecompressPixels(const uint8_t* src, size_t srcSize,
+                                 uint8_t* dst, uint32_t dstSize);
 
     ImageDecoder* decoder_ = nullptr;
     CacheManager* cache_ = nullptr;

@@ -89,6 +89,7 @@ void Application::Shutdown()
     }
     SaveRecents();
     SaveAlbumFolders();
+    SaveFolderProfiles();
 
     // Wait for any in-flight persistent thumbnail save
     if (thumbSaveThread_.joinable()) {
@@ -145,6 +146,7 @@ int Application::Run(int nCmdShow)
     if (currentImages_.empty()) {
         LoadAlbumFolders();
         LoadHiddenAlbums();
+        LoadFolderProfiles();
 
         // Load persistent thumbnail cache (memory-mapped for instant pixel access)
         if (pipeline_) {
@@ -271,6 +273,27 @@ void Application::StartFullScan()
             }
         }
         folders = std::move(unique);
+    }
+
+    // Reorder folders by access profile: frequently visited folders are scanned
+    // first so their thumbnails appear sooner (Ledger-inspired prefetch).
+    if (!folderProfiles_.empty()) {
+        std::unordered_map<std::wstring, uint32_t> visitMap;
+        for (const auto& fp : folderProfiles_) {
+            std::wstring key = fp.folder.wstring();
+            std::transform(key.begin(), key.end(), key.begin(), ::towlower);
+            visitMap[key] = fp.visitCount;
+        }
+        std::stable_sort(folders.begin(), folders.end(),
+            [&visitMap](const std::filesystem::path& a, const std::filesystem::path& b) {
+                std::wstring ka = a.wstring(), kb = b.wstring();
+                std::transform(ka.begin(), ka.end(), ka.begin(), ::towlower);
+                std::transform(kb.begin(), kb.end(), kb.begin(), ::towlower);
+                uint32_t va = 0, vb = 0;
+                auto ia = visitMap.find(ka); if (ia != visitMap.end()) va = ia->second;
+                auto ib = visitMap.find(kb); if (ib != visitMap.end()) vb = ib->second;
+                return va > vb;
+            });
     }
 
     DebugLog(("Full scan: " + std::to_string(folders.size()) + " folders").c_str());
@@ -479,6 +502,9 @@ bool Application::InitializeComponents()
     });
     viewManager_->GetGalleryView()->SetAddAlbumCallback([this]() {
         AddAlbumFolder();
+    });
+    viewManager_->GetGalleryView()->SetFolderVisitCallback([this](const auto& folder) {
+        RecordFolderVisit(folder);
     });
 
     LoadRecents();
@@ -1365,6 +1391,127 @@ std::vector<ScannedImage> Application::LoadScanCache()
     }
 
     return results;
+}
+
+// --- Folder access profiles (Ledger-inspired persistence) ---
+
+std::filesystem::path Application::GetFolderProfilePath() const
+{
+    PWSTR outPath = nullptr;
+    if (FAILED(SHGetKnownFolderPath(FOLDERID_LocalAppData, 0, nullptr, &outPath))) {
+        return {};
+    }
+    std::filesystem::path base(outPath);
+    CoTaskMemFree(outPath);
+    return base / L"UltraImageViewer" / L"folder_profiles.bin";
+}
+
+void Application::LoadFolderProfiles()
+{
+    folderProfiles_.clear();
+    auto path = GetFolderProfilePath();
+    if (path.empty()) return;
+
+    FILE* f = _wfopen(path.c_str(), L"rb");
+    if (!f) return;
+
+    // Header: "FPROF" + version(4) + count(4)
+    char magic[6] = {};
+    fread(magic, 1, 5, f);
+    if (memcmp(magic, "FPROF", 5) != 0) { fclose(f); return; }
+
+    uint32_t version = 0, count = 0;
+    fread(&version, 4, 1, f);
+    fread(&count, 4, 1, f);
+    if (version != 1) { fclose(f); return; }
+
+    for (uint32_t i = 0; i < count; ++i) {
+        uint16_t pathLen = 0;
+        if (fread(&pathLen, 2, 1, f) != 1) break;
+
+        std::wstring wpath(pathLen, L'\0');
+        if (fread(wpath.data(), sizeof(wchar_t), pathLen, f) != pathLen) break;
+
+        FolderProfile fp;
+        fp.folder = std::filesystem::path(std::move(wpath));
+        fread(&fp.visitCount, 4, 1, f);
+        fread(&fp.thumbnailCount, 4, 1, f);
+        fread(&fp.totalDecodeTimeMs, 8, 1, f);
+        fread(&fp.lastVisitEpoch, 8, 1, f);
+        folderProfiles_.push_back(std::move(fp));
+    }
+
+    fclose(f);
+    DebugLog(("Loaded " + std::to_string(folderProfiles_.size()) + " folder profiles").c_str());
+}
+
+void Application::SaveFolderProfiles()
+{
+    auto path = GetFolderProfilePath();
+    if (path.empty()) return;
+
+    std::filesystem::create_directories(path.parent_path());
+    FILE* f = _wfopen(path.c_str(), L"wb");
+    if (!f) return;
+
+    fwrite("FPROF", 1, 5, f);
+    uint32_t version = 1;
+    uint32_t count = static_cast<uint32_t>(folderProfiles_.size());
+    fwrite(&version, 4, 1, f);
+    fwrite(&count, 4, 1, f);
+
+    for (const auto& fp : folderProfiles_) {
+        std::wstring wpath = fp.folder.wstring();
+        uint16_t pathLen = static_cast<uint16_t>(wpath.size());
+        fwrite(&pathLen, 2, 1, f);
+        fwrite(wpath.data(), sizeof(wchar_t), pathLen, f);
+        fwrite(&fp.visitCount, 4, 1, f);
+        fwrite(&fp.thumbnailCount, 4, 1, f);
+        fwrite(&fp.totalDecodeTimeMs, 8, 1, f);
+        fwrite(&fp.lastVisitEpoch, 8, 1, f);
+    }
+
+    fclose(f);
+}
+
+void Application::RecordFolderVisit(const std::filesystem::path& folder)
+{
+    auto now = std::chrono::system_clock::now();
+    int64_t epoch = std::chrono::duration_cast<std::chrono::seconds>(
+        now.time_since_epoch()).count();
+
+    for (auto& fp : folderProfiles_) {
+        if (fp.folder == folder) {
+            fp.visitCount++;
+            fp.lastVisitEpoch = epoch;
+            return;
+        }
+    }
+
+    // New folder
+    FolderProfile fp;
+    fp.folder = folder;
+    fp.visitCount = 1;
+    fp.lastVisitEpoch = epoch;
+    folderProfiles_.push_back(std::move(fp));
+}
+
+std::vector<std::filesystem::path> Application::GetPrioritizedFolders() const
+{
+    // Sort by visit count descending, then by recency
+    auto sorted = folderProfiles_;
+    std::sort(sorted.begin(), sorted.end(),
+        [](const FolderProfile& a, const FolderProfile& b) {
+            if (a.visitCount != b.visitCount) return a.visitCount > b.visitCount;
+            return a.lastVisitEpoch > b.lastVisitEpoch;
+        });
+
+    std::vector<std::filesystem::path> result;
+    result.reserve(sorted.size());
+    for (const auto& fp : sorted) {
+        result.push_back(fp.folder);
+    }
+    return result;
 }
 
 } // namespace Core

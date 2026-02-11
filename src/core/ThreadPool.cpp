@@ -6,6 +6,8 @@
 namespace UltraImageViewer {
 namespace Core {
 
+thread_local int ThreadPool::tl_currentLane_ = -1;
+
 ThreadPool::ThreadPool(uint32_t numThreads)
 {
     if (numThreads == 0) {
@@ -123,15 +125,17 @@ void ThreadPool::WaitIdle()
     });
 }
 
-std::optional<std::function<void()>> ThreadPool::TryDequeue()
+std::optional<ThreadPool::DequeuedTask> ThreadPool::TryDequeue()
 {
     std::lock_guard lock(mutex_);
     for (int i = 0; i < kLaneCount; ++i) {
         auto& q = lanes_[i].queue;
         if (!q.empty()) {
-            auto fn = std::move(q.front());
+            DequeuedTask result;
+            result.fn = std::move(q.front());
+            result.lane = i;
             q.pop_front();
-            return fn;
+            return result;
         }
     }
     return std::nullopt;
@@ -139,24 +143,48 @@ std::optional<std::function<void()>> ThreadPool::TryDequeue()
 
 void ThreadPool::WorkerFunc(uint32_t /*index*/)
 {
+    // Map lane index to Windows thread priority for "unfair scheduling":
+    //   High (0)   → THREAD_PRIORITY_ABOVE_NORMAL  (visible thumbnails)
+    //   Normal (1) → THREAD_PRIORITY_NORMAL         (default)
+    //   Low (2)    → THREAD_PRIORITY_BELOW_NORMAL   (prefetch)
+    static constexpr int kLanePriority[] = {
+        THREAD_PRIORITY_ABOVE_NORMAL,
+        THREAD_PRIORITY_NORMAL,
+        THREAD_PRIORITY_BELOW_NORMAL,
+    };
+
+    auto executeTask = [this](DequeuedTask& task) {
+        pending_.fetch_sub(1, std::memory_order_relaxed);
+        active_.fetch_add(1, std::memory_order_relaxed);
+
+        // Set OS thread priority based on task lane (unfair scheduling)
+        int prio = kLanePriority[task.lane];
+        bool changed = (prio != THREAD_PRIORITY_NORMAL);
+        if (changed) SetThreadPriority(GetCurrentThread(), prio);
+
+        tl_currentLane_ = task.lane;
+        task.fn();
+        tl_currentLane_ = -1;
+
+        if (changed) SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_NORMAL);
+
+        active_.fetch_sub(1, std::memory_order_relaxed);
+        completed_.fetch_add(1, std::memory_order_relaxed);
+
+        if (pending_.load(std::memory_order_relaxed) == 0 &&
+            active_.load(std::memory_order_relaxed) == 0) {
+            idleCV_.notify_all();
+        }
+    };
+
     while (!shutdown_.load(std::memory_order_acquire)) {
 
         // Phase 1: Spin — try to grab a task with no syscall
         for (int spin = 0; spin < kSpinCount; ++spin) {
             auto task = TryDequeue();
             if (task) {
-                pending_.fetch_sub(1, std::memory_order_relaxed);
-                active_.fetch_add(1, std::memory_order_relaxed);
-                (*task)();
-                active_.fetch_sub(1, std::memory_order_relaxed);
-                completed_.fetch_add(1, std::memory_order_relaxed);
-
-                // Notify WaitIdle if everything drained
-                if (pending_.load(std::memory_order_relaxed) == 0 &&
-                    active_.load(std::memory_order_relaxed) == 0) {
-                    idleCV_.notify_all();
-                }
-                goto next_cycle;  // restart hot loop
+                executeTask(*task);
+                goto next_cycle;
             }
         }
 
@@ -165,16 +193,7 @@ void ThreadPool::WorkerFunc(uint32_t /*index*/)
             _mm_pause();
             auto task = TryDequeue();
             if (task) {
-                pending_.fetch_sub(1, std::memory_order_relaxed);
-                active_.fetch_add(1, std::memory_order_relaxed);
-                (*task)();
-                active_.fetch_sub(1, std::memory_order_relaxed);
-                completed_.fetch_add(1, std::memory_order_relaxed);
-
-                if (pending_.load(std::memory_order_relaxed) == 0 &&
-                    active_.load(std::memory_order_relaxed) == 0) {
-                    idleCV_.notify_all();
-                }
+                executeTask(*task);
                 goto next_cycle;
             }
         }
@@ -183,7 +202,6 @@ void ThreadPool::WorkerFunc(uint32_t /*index*/)
         {
             std::unique_lock lock(mutex_);
             cv_.wait(lock, [this] {
-                // Check if any lane has work
                 for (int i = 0; i < kLaneCount; ++i) {
                     if (!lanes_[i].queue.empty()) return true;
                 }

@@ -174,6 +174,24 @@ private:
     // Persistent thumbnail cache (background save)
     std::jthread thumbSaveThread_;
     std::atomic<bool> thumbSaveDone_{true};
+
+    // --- Folder access profile (Ledger-inspired) ---
+    // Tracks usage patterns per folder, persisted to disk for cold-start prefetch
+    struct FolderProfile {
+        std::filesystem::path folder;
+        uint32_t visitCount = 0;
+        uint32_t thumbnailCount = 0;
+        uint64_t totalDecodeTimeMs = 0;
+        int64_t lastVisitEpoch = 0;  // seconds since epoch
+    };
+    std::vector<FolderProfile> folderProfiles_;
+
+    void LoadFolderProfiles();
+    void SaveFolderProfiles();
+    void RecordFolderVisit(const std::filesystem::path& folder);
+    std::filesystem::path GetFolderProfilePath() const;
+    // Returns folders sorted by visit frequency (most visited first)
+    std::vector<std::filesystem::path> GetPrioritizedFolders() const;
 };
 
 } // namespace Core

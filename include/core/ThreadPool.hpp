@@ -20,6 +20,10 @@ public:
     explicit ThreadPool(uint32_t numThreads = 0);  // 0 = auto
     ~ThreadPool();
 
+    // Current task's lane for the calling thread (0=High, 1=Normal, 2=Low).
+    // Only meaningful inside a task callback. Returns -1 outside a task.
+    static int CurrentLane() { return tl_currentLane_; }
+
     ThreadPool(const ThreadPool&) = delete;
     ThreadPool& operator=(const ThreadPool&) = delete;
 
@@ -49,7 +53,12 @@ public:
 
 private:
     void WorkerFunc(uint32_t index);
-    std::optional<std::function<void()>> TryDequeue();
+
+    struct DequeuedTask {
+        std::function<void()> fn;
+        int lane;  // 0=High, 1=Normal, 2=Low
+    };
+    std::optional<DequeuedTask> TryDequeue();
 
     static constexpr int kLaneCount = 3;
     static constexpr int kSpinCount = 64;
@@ -72,6 +81,8 @@ private:
     alignas(64) std::atomic<uint32_t> active_{0};
     alignas(64) std::atomic<uint64_t> completed_{0};
     std::atomic<bool> shutdown_{false};
+
+    static thread_local int tl_currentLane_;
 };
 
 } // namespace Core

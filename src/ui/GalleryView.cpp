@@ -225,6 +225,11 @@ void GalleryView::SetAddAlbumCallback(std::function<void()> cb)
     addAlbumCallback_ = std::move(cb);
 }
 
+void GalleryView::SetFolderVisitCallback(std::function<void(const std::filesystem::path&)> cb)
+{
+    folderVisitCallback_ = std::move(cb);
+}
+
 void GalleryView::SetEditMode(bool enabled)
 {
     if (editMode_ == enabled) return;
@@ -282,6 +287,11 @@ void GalleryView::EnterFolderDetail(size_t albumIndex)
     inFolderDetail_ = true;
     openFolderIndex_ = albumIndex;
     const auto& album = folderAlbums_[albumIndex];
+
+    // Record folder visit for access profile (Ledger-inspired prefetch prioritization)
+    if (folderVisitCallback_) {
+        folderVisitCallback_(album.folderPath);
+    }
 
     folderDetailImages_.clear();
     folderDetailSections_.clear();
@@ -551,6 +561,13 @@ void GalleryView::Render(Rendering::Direct2DRenderer* renderer)
 
     EnsureGlassEffects(ctx);
 
+    // Compute frame budget deadline for content rendering.
+    // Content gets ContentBudgetMs; remaining time is reserved for glass overlays.
+    QueryPerformanceFrequency(&framePerfFreq_);
+    QueryPerformanceCounter(&frameStart_);
+    frameBudgetDeadline_.QuadPart = frameStart_.QuadPart +
+        static_cast<LONGLONG>(Theme::ContentBudgetMs * 0.001 * framePerfFreq_.QuadPart);
+
     // Flush decoded thumbnails once per frame
     if (pipeline_) {
         pipeline_->FlushReadyThumbnails(Theme::MaxBitmapsPerFrame);
@@ -666,7 +683,9 @@ static void RenderImageGrid(
     std::optional<size_t> skipIndex,
     bool isFastScrolling,
     float dpiScale,
-    std::vector<std::filesystem::path>* outVisiblePaths)
+    std::vector<std::filesystem::path>* outVisiblePaths,
+    LARGE_INTEGER budgetDeadline = {},
+    LARGE_INTEGER perfFreq = {})
 {
     // Cap thumbnail resolution to keep memory footprint small (160×160×4 = 100KB each)
     // so the cache can hold 10,000+ thumbnails without eviction.
@@ -677,6 +696,12 @@ static void RenderImageGrid(
     // Prefetch buffer: pre-decode 1.5 screens above and below the viewport
     // so thumbnails are ready before the user scrolls to them.
     float prefetchMargin = contentHeight * Theme::PrefetchScreens;
+
+    // Frame budget: stop rendering content if we've exceeded our time budget,
+    // ensuring glass overlays always get rendered (dual-rendering-inspired).
+    bool hasBudget = (budgetDeadline.QuadPart > 0 && perfFreq.QuadPart > 0);
+    int cellsSinceBudgetCheck = 0;
+    bool budgetExhausted = false;
 
     for (size_t s = 0; s < sections.size(); ++s) {
         const auto& section = sections[s];
@@ -774,7 +799,23 @@ static void RenderImageGrid(
                     ctx->FillRoundedRectangle(roundedCell, hoverBrush);
                 }
             }
+
+            // Frame budget check: periodically test if we've exceeded our
+            // content rendering budget. If so, stop drawing more cells so
+            // glass overlays (tab bar, back button) always render on time.
+            if (hasBudget && onScreen) {
+                if (++cellsSinceBudgetCheck >= Theme::BudgetCheckInterval) {
+                    cellsSinceBudgetCheck = 0;
+                    LARGE_INTEGER now;
+                    QueryPerformanceCounter(&now);
+                    if (now.QuadPart >= budgetDeadline.QuadPart) {
+                        budgetExhausted = true;
+                        break;
+                    }
+                }
+            }
         }
+        if (budgetExhausted) break;
     }
 }
 
@@ -804,7 +845,8 @@ void GalleryView::RenderPhotosTab(Rendering::Direct2DRenderer* renderer,
         cellBrush_.Get(), textBrush_.Get(), secondaryBrush_.Get(), hoverBrush_.Get(),
         sectionFormat_.Get(), countRightFormat_.Get(),
         hoverX_, hoverY_, skipIndex_,
-        isFastScrolling_, dpiScale, &visiblePaths);
+        isFastScrolling_, dpiScale, &visiblePaths,
+        frameBudgetDeadline_, framePerfFreq_);
 
     // Tell pipeline which paths are visible for prioritization
     if (pipeline_ && !visiblePaths.empty()) {
@@ -1146,7 +1188,8 @@ void GalleryView::RenderFolderDetail(Rendering::Direct2DRenderer* renderer,
         cellBrush_.Get(), textBrush_.Get(), secondaryBrush_.Get(), hoverBrush_.Get(),
         sectionFormat_.Get(), countRightFormat_.Get(),
         hoverX_, hoverY_, skipIndex_,
-        isFastScrolling_, dpiScale, &visiblePaths);
+        isFastScrolling_, dpiScale, &visiblePaths,
+        frameBudgetDeadline_, framePerfFreq_);
 
     // Tell pipeline which paths are visible for prioritization
     if (pipeline_ && !visiblePaths.empty()) {

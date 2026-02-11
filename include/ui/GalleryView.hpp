@@ -90,6 +90,7 @@ public:
     void SetEditMode(bool enabled);
     void SetDeleteAlbumCallback(std::function<void(const std::filesystem::path&)> cb);
     void SetAddAlbumCallback(std::function<void()> cb);
+    void SetFolderVisitCallback(std::function<void(const std::filesystem::path&)> cb);
 
     // Public types needed by rendering helpers
     struct Section {
@@ -277,6 +278,7 @@ private:
     Animation::SpringAnimation deleteCardScale_; // 1→0 for card shrink
     std::function<void(const std::filesystem::path&)> deleteAlbumCallback_;
     std::function<void()> addAlbumCallback_;
+    std::function<void(const std::filesystem::path&)> folderVisitCallback_;
 
     void RenderGlassEditButton(ID2D1DeviceContext* ctx, ID2D1Bitmap* contentBitmap);
     void RenderDeleteBadge(ID2D1DeviceContext* ctx, float cx, float cy, float scale);
@@ -288,6 +290,11 @@ private:
     Microsoft::WRL::ComPtr<ID2D1SolidColorBrush> addCardBorderBrush_;
     Microsoft::WRL::ComPtr<ID2D1SolidColorBrush> addCardIconBrush_;
     Microsoft::WRL::ComPtr<IDWriteTextFormat> editButtonFormat_;
+
+    // Frame budget (dual-rendering-inspired: content vs glass overlay split)
+    LARGE_INTEGER frameStart_ = {};
+    LARGE_INTEGER frameBudgetDeadline_ = {};
+    LARGE_INTEGER framePerfFreq_ = {};
 
     bool resourcesCreated_ = false;
     void EnsureResources(Rendering::Direct2DRenderer* renderer);

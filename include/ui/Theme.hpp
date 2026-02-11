@@ -98,6 +98,8 @@ namespace Theme {
     constexpr size_t ThumbnailCacheMaxBytes = 1024ULL * 1024 * 1024;  // 1GB LRU eviction threshold
     constexpr uint32_t ThumbnailMaxPx = 160;                         // max thumbnail decode resolution (px)
     constexpr float PrefetchScreens = 3.0f;              // prefetch N screens above/below viewport
+    constexpr float ContentBudgetMs = 12.0f;              // max ms for content rendering (reserves time for glass overlays)
+    constexpr int BudgetCheckInterval = 16;                // check budget every N cells (amortize QueryPerformanceCounter)
 
 } // namespace Theme
 } // namespace UI

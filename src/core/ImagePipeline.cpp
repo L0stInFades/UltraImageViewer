@@ -6,6 +6,8 @@
 #include <windows.h>
 #include <shlobj.h>
 #include <knownfolders.h>
+#include <compressapi.h>
+#pragma comment(lib, "cabinet.lib")
 
 namespace UltraImageViewer {
 namespace Core {
@@ -47,6 +49,8 @@ void ImagePipeline::Shutdown()
     std::lock_guard lock(cacheMutex_);
     thumbnailCache_.clear();
     thumbnailCacheBytes_ = 0;
+    tier2Cache_.clear();
+    tier2Bytes_ = 0;
     fullImageCache_.clear();
     pendingRequests_.clear();
 }
@@ -655,11 +659,40 @@ void ImagePipeline::ThumbnailDecodeTask(const std::filesystem::path& path,
         if (thumbnailCache_.contains(path)) return;
     }
 
-    // Try persistent thumbnail cache first (memcpy vs JPEG decode = 100x faster)
+    // I/O priority: Low-priority (prefetch) tasks enter background mode,
+    // reducing both I/O and memory priority so they don't compete with
+    // visible thumbnail decodes for disk bandwidth.
+    bool lowIoPriority = (ThreadPool::CurrentLane() == static_cast<int>(TaskPriority::Low));
+    if (lowIoPriority) {
+        SetThreadPriority(GetCurrentThread(), THREAD_MODE_BACKGROUND_BEGIN);
+    }
+
+    // Tier 2: check CPU-RAM compressed cache first (~0.3ms decompress vs ~5ms disk)
     std::unique_ptr<uint8_t[]> pixels;
     uint32_t imgWidth = 0, imgHeight = 0;
 
     {
+        std::lock_guard lock(cacheMutex_);
+        auto t2it = tier2Cache_.find(path);
+        if (t2it != tier2Cache_.end()) {
+            imgWidth = t2it->second.width;
+            imgHeight = t2it->second.height;
+            uint32_t rawSize = t2it->second.rawSize;
+            pixels = std::make_unique<uint8_t[]>(rawSize);
+            if (DecompressPixels(t2it->second.data.get(), t2it->second.compressedSize,
+                                 pixels.get(), rawSize)) {
+                // Hit — remove from Tier 2 (will be promoted back to Tier 1)
+                tier2Bytes_ -= t2it->second.compressedSize;
+                tier2Cache_.erase(t2it);
+            } else {
+                pixels.reset();
+                imgWidth = imgHeight = 0;
+            }
+        }
+    }
+
+    // Tier 3: try persistent thumbnail cache (memcpy vs JPEG decode = 100x faster)
+    if (!pixels) {
         std::shared_lock plock(persistMutex_);
         auto it = persistIndex_.find(path);
         if (it != persistIndex_.end()) {
@@ -673,17 +706,28 @@ void ImagePipeline::ThumbnailDecodeTask(const std::filesystem::path& path,
 
     // Fall back to JPEG decode if not in persistent cache
     if (!pixels) {
-        if (!decoder_) return;
+        if (!decoder_) {
+            if (lowIoPriority) SetThreadPriority(GetCurrentThread(), THREAD_MODE_BACKGROUND_END);
+            return;
+        }
 
         auto image = decoder_->GenerateThumbnail(path, targetSize);
         if (!image || !image->data) {
             image = decoder_->Decode(path, DecoderFlags::SIMD);
         }
-        if (!image || !image->data) return;
+        if (!image || !image->data) {
+            if (lowIoPriority) SetThreadPriority(GetCurrentThread(), THREAD_MODE_BACKGROUND_END);
+            return;
+        }
 
         pixels = std::move(image->data);
         imgWidth = image->info.width;
         imgHeight = image->info.height;
+    }
+
+    // End background I/O mode before pushing to ready queue
+    if (lowIoPriority) {
+        SetThreadPriority(GetCurrentThread(), THREAD_MODE_BACKGROUND_END);
     }
 
     // Check generation again after decode
@@ -702,19 +746,57 @@ void ImagePipeline::ThumbnailDecodeTask(const std::filesystem::path& path,
     }
 }
 
+// --- Tier 2 compressed cache: compress/decompress helpers ---
+
+bool ImagePipeline::CompressPixels(const uint8_t* src, uint32_t srcSize,
+                                    std::unique_ptr<uint8_t[]>& outBuf, size_t& outSize)
+{
+    COMPRESSOR_HANDLE compressor = nullptr;
+    if (!CreateCompressor(COMPRESS_ALGORITHM_XPRESS_HUFF, nullptr, &compressor))
+        return false;
+
+    SIZE_T compressedSize = 0;
+    Compress(compressor, src, srcSize, nullptr, 0, &compressedSize);
+    if (compressedSize == 0) {
+        CloseCompressor(compressor);
+        return false;
+    }
+
+    outBuf = std::make_unique<uint8_t[]>(compressedSize);
+    BOOL ok = Compress(compressor, src, srcSize, outBuf.get(), compressedSize, &compressedSize);
+    CloseCompressor(compressor);
+
+    if (!ok) return false;
+    outSize = static_cast<size_t>(compressedSize);
+    return true;
+}
+
+bool ImagePipeline::DecompressPixels(const uint8_t* src, size_t srcSize,
+                                      uint8_t* dst, uint32_t dstSize)
+{
+    DECOMPRESSOR_HANDLE decompressor = nullptr;
+    if (!CreateDecompressor(COMPRESS_ALGORITHM_XPRESS_HUFF, nullptr, &decompressor))
+        return false;
+
+    SIZE_T decompressedSize = 0;
+    BOOL ok = Decompress(decompressor, src, srcSize, dst, dstSize, &decompressedSize);
+    CloseDecompressor(decompressor);
+    return ok && decompressedSize == dstSize;
+}
+
 void ImagePipeline::EvictThumbnailsIfNeeded()
 {
     std::lock_guard lock(cacheMutex_);
 
     if (thumbnailCacheBytes_ <= UI::Theme::ThumbnailCacheMaxBytes) return;
 
-    // visiblePaths_ is now under cacheMutex_ — no separate lock needed
-
     // Build a list sorted by last access time (oldest first)
     struct EvictCandidate {
         std::filesystem::path path;
         std::chrono::steady_clock::time_point lastAccess;
         size_t bytes;
+        uint32_t width;
+        uint32_t height;
     };
 
     std::vector<EvictCandidate> candidates;
@@ -723,7 +805,7 @@ void ImagePipeline::EvictThumbnailsIfNeeded()
         // Never evict visible thumbnails
         if (visiblePaths_.contains(path)) continue;
         size_t bytes = static_cast<size_t>(entry.width) * entry.height * 4;
-        candidates.push_back({path, entry.lastAccess, bytes});
+        candidates.push_back({path, entry.lastAccess, bytes, entry.width, entry.height});
     }
 
     std::sort(candidates.begin(), candidates.end(),
@@ -731,16 +813,55 @@ void ImagePipeline::EvictThumbnailsIfNeeded()
             return a.lastAccess < b.lastAccess;
         });
 
-    // Evict to 75% of budget to avoid thrashing (constant evict-refill cycles)
+    // Collect evicted bitmaps for Tier 2 demotion (readback pixels before releasing)
+    struct DemoteEntry {
+        std::filesystem::path path;
+        uint32_t width, height;
+        size_t rawBytes;
+    };
+    std::vector<DemoteEntry> demoteList;
+
+    // Evict to 75% of budget to avoid thrashing
     size_t targetBytes = UI::Theme::ThumbnailCacheMaxBytes * 3 / 4;
     for (const auto& c : candidates) {
         if (thumbnailCacheBytes_ <= targetBytes) break;
+
+        // Try to demote to Tier 2 (if not already there and Tier 2 has space)
+        if (!tier2Cache_.contains(c.path) && tier2Bytes_ < kTier2MaxBytes) {
+            demoteList.push_back({c.path, c.width, c.height, c.bytes});
+        }
 
         thumbnailCache_.erase(c.path);
         if (thumbnailCacheBytes_ >= c.bytes) {
             thumbnailCacheBytes_ -= c.bytes;
         } else {
             thumbnailCacheBytes_ = 0;
+        }
+    }
+
+    // Tier 2 demotion: read pixel data back from D2D bitmaps and compress.
+    // Note: D2D1Bitmap doesn't support CPU readback directly, so we use the
+    // thumbSaveBuffer_ which already has raw pixels from FlushReadyThumbnails.
+    {
+        std::lock_guard saveLock(thumbSaveMutex_);
+        for (const auto& d : demoteList) {
+            auto saveIt = thumbSaveBuffer_.find(d.path);
+            if (saveIt == thumbSaveBuffer_.end() || !saveIt->second.pixels) continue;
+
+            uint32_t rawSize = d.width * d.height * 4;
+            std::unique_ptr<uint8_t[]> compressed;
+            size_t compressedSize = 0;
+
+            if (CompressPixels(saveIt->second.pixels.get(), rawSize, compressed, compressedSize)) {
+                CompressedThumbnail ct;
+                ct.data = std::move(compressed);
+                ct.compressedSize = compressedSize;
+                ct.rawSize = rawSize;
+                ct.width = static_cast<uint16_t>(d.width);
+                ct.height = static_cast<uint16_t>(d.height);
+                tier2Bytes_ += compressedSize;
+                tier2Cache_[d.path] = std::move(ct);
+            }
         }
     }
 }
