@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.25)
-project(Afterglow VERSION 1.5.1 LANGUAGES CXX)
+project(Afterglow VERSION 1.5.2 LANGUAGES CXX)
 
 # C++20 with latest features
 set(CMAKE_CXX_STANDARD 20)
@@ -59,6 +59,7 @@ set(SOURCES
     src/core/CacheManager.cpp
     src/core/ThreadPool.cpp
     src/core/ImagePipeline.cpp
+    src/core/SimdUtils.cpp
     src/rendering/Direct2DRenderer.cpp
     src/ui/CommandPalette.cpp
     src/ui/GestureHandler.cpp

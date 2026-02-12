@@ -1,4 +1,5 @@
 #include "core/ImagePipeline.hpp"
+#include "core/SimdUtils.hpp"
 #include "ui/Theme.hpp"
 #include <algorithm>
 #include <set>
@@ -175,8 +176,7 @@ std::vector<std::filesystem::path> ImagePipeline::ScanDirectory(const std::files
     for (const auto& entry : std::filesystem::directory_iterator(dir)) {
         if (!entry.is_regular_file()) continue;
         auto ext = entry.path().extension().wstring();
-        // Convert to lowercase
-        std::transform(ext.begin(), ext.end(), ext.begin(), ::towlower);
+        Simd::ToLowerInPlace(ext);
         if (supportedExts.contains(ext)) {
             result.push_back(entry.path());
         }
@@ -287,13 +287,12 @@ std::vector<ScannedImage> ImagePipeline::ScanFolders(
                     }
                 } else if (entry.is_regular_file(ec)) {
                     auto ext = entry.path().extension().wstring();
-                    std::transform(ext.begin(), ext.end(), ext.begin(), ::towlower);
+                    Simd::ToLowerInPlace(ext);
 
                     if (supportedExts.contains(ext)) {
                         // Deduplicate by lowercase path
                         std::wstring lowerPath = entry.path().wstring();
-                        std::transform(lowerPath.begin(), lowerPath.end(),
-                                       lowerPath.begin(), ::towlower);
+                        Simd::ToLowerInPlace(lowerPath);
 
                         if (!seen.contains(lowerPath)) {
                             seen.insert(lowerPath);
@@ -455,7 +454,7 @@ Microsoft::WRL::ComPtr<ID2D1Bitmap> ImagePipeline::DecodeAndCreateBitmap(
 {
     if (!decoder_ || !renderer_) return nullptr;
 
-    auto image = decoder_->Decode(path, DecoderFlags::SIMD);
+    auto image = decoder_->Decode(path, DecoderFlags::ZeroCopy);
     if (!image || !image->data) return nullptr;
 
     auto bitmap = renderer_->CreateBitmap(
@@ -472,7 +471,7 @@ Microsoft::WRL::ComPtr<ID2D1Bitmap> ImagePipeline::DecodeAndCreateThumbnail(
     auto image = decoder_->GenerateThumbnail(path, maxSize);
     if (!image || !image->data) {
         // Fall back to full decode
-        image = decoder_->Decode(path, DecoderFlags::SIMD);
+        image = decoder_->Decode(path, DecoderFlags::ZeroCopy);
     }
     if (!image || !image->data) return nullptr;
 
@@ -724,7 +723,7 @@ void ImagePipeline::ThumbnailDecodeTask(const std::filesystem::path& path,
 
         auto image = decoder_->GenerateThumbnail(path, targetSize);
         if (!image || !image->data) {
-            image = decoder_->Decode(path, DecoderFlags::SIMD);
+            image = decoder_->Decode(path, DecoderFlags::ZeroCopy);
         }
         if (!image || !image->data) return;
 

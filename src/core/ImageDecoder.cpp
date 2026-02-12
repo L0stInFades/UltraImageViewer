@@ -1,7 +1,7 @@
 #include "core/ImageDecoder.hpp"
+#include "core/SimdUtils.hpp"
 #include <stdexcept>
 #include <algorithm>
-#include <intrin.h>
 #include <cstring>
 #include <thread>
 
@@ -21,8 +21,6 @@ ImageDecoder::ImageDecoder()
     if (FAILED(hr)) {
         throw std::runtime_error("Failed to create WIC factory");
     }
-
-    DetectCPUFeatures();
 }
 
 ImageDecoder::~ImageDecoder() = default;
@@ -193,7 +191,7 @@ bool ImageDecoder::IsSupportedFormat(const std::filesystem::path& filePath)
     };
 
     std::wstring ext = filePath.extension().wstring();
-    std::transform(ext.begin(), ext.end(), ext.begin(), ::towlower);
+    Simd::ToLowerInPlace(ext);
 
     return std::find(extensions.begin(), extensions.end(), ext) != extensions.end();
 }
@@ -273,11 +271,6 @@ std::unique_ptr<DecodedImage> ImageDecoder::DecodeWithWIC(
         return nullptr;
     }
 
-    // Apply SIMD processing if enabled
-    if (HasFlag(flags, DecoderFlags::SIMD)) {
-        // TODO: Apply SIMD-based post-processing (color correction, etc.)
-    }
-
     image->info.bitsPerPixel = 32;
     image->info.hasAlpha = true;
     image->info.isHDR = false;
@@ -293,65 +286,6 @@ std::unique_ptr<DecodedImage> ImageDecoder::DecodeRAW(
     return nullptr;
 }
 
-// AVX2 optimized format conversion
-void ImageDecoder::ConvertFormat_SIMD(uint8_t* dest, const uint8_t* src, size_t pixelCount)
-{
-    if (!hasAVX2_) {
-        ConvertFormat_SSE42(dest, src, pixelCount);
-        return;
-    }
-
-    size_t i = 0;
-    const size_t avx2Stride = 8; // Process 8 pixels per iteration (32 bytes)
-
-    // Process 8 pixels at a time with AVX2
-    for (; i + avx2Stride <= pixelCount; i += avx2Stride) {
-        __m256i data = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(src + i * 4));
-
-        // Apply any format conversions here
-        // For BGRA to BGRA, this is just a copy, but we can apply
-        // color space conversions, gamma correction, etc.
-
-        _mm256_storeu_si256(reinterpret_cast<__m256i*>(dest + i * 4), data);
-    }
-
-    // Handle remaining pixels
-    if (i < pixelCount) {
-        ConvertFormat_Fallback(dest + i * 4, src + i * 4, pixelCount - i);
-    }
-}
-
-// SSE4.2 optimized format conversion
-void ImageDecoder::ConvertFormat_SSE42(uint8_t* dest, const uint8_t* src, size_t pixelCount)
-{
-    if (!hasSSE42_) {
-        ConvertFormat_Fallback(dest, src, pixelCount);
-        return;
-    }
-
-    size_t i = 0;
-    const size_t sseStride = 4; // Process 4 pixels per iteration (16 bytes)
-
-    // Process 4 pixels at a time with SSE4.2
-    for (; i + sseStride <= pixelCount; i += sseStride) {
-        __m128i data = _mm_loadu_si128(reinterpret_cast<const __m128i*>(src + i * 4));
-
-        // Apply conversions
-        _mm_storeu_si128(reinterpret_cast<__m128i*>(dest + i * 4), data);
-    }
-
-    // Handle remaining pixels
-    if (i < pixelCount) {
-        ConvertFormat_Fallback(dest + i * 4, src + i * 4, pixelCount - i);
-    }
-}
-
-// Fallback implementation
-void ImageDecoder::ConvertFormat_Fallback(uint8_t* dest, const uint8_t* src, size_t pixelCount)
-{
-    std::memcpy(dest, src, pixelCount * 4);
-}
-
 std::unique_ptr<DecodedImage> ImageDecoder::DecodeMemoryMapped(
     const std::filesystem::path& filePath,
     DecoderFlags flags)
@@ -364,36 +298,6 @@ std::unique_ptr<DecodedImage> ImageDecoder::DecodeMemoryMapped(
     // 4. Return DecodedImage with pointer to mapped view
 
     return nullptr;
-}
-
-void ImageDecoder::DetectCPUFeatures()
-{
-    // CPUID detection for SIMD support
-    int cpuInfo[4];
-
-    // Get max leaf
-    __cpuid(cpuInfo, 0);
-    int nIds = cpuInfo[0];
-
-    // Check for AVX2 (Leaf 7, Sub-leaf 0, EBX bit 5)
-    if (nIds >= 7) {
-        __cpuidex(cpuInfo, 7, 0);
-        hasAVX2_ = (cpuInfo[1] & (1 << 5)) != 0;
-        hasAVX512_ = (cpuInfo[1] & (1 << 16)) != 0; // AVX512F
-    }
-
-    // Check for SSE4.2 (Leaf 1, ECX bit 20)
-    __cpuid(cpuInfo, 1);
-    hasSSE42_ = (cpuInfo[2] & (1 << 20)) != 0;
-
-    // Check for AVX support (Leaf 1, ECX bit 28)
-    bool hasAVX = (cpuInfo[2] & (1 << 28)) != 0;
-
-    // AVX2 requires AVX
-    if (!hasAVX) {
-        hasAVX2_ = false;
-        hasAVX512_ = false;
-    }
 }
 
 } // namespace Core

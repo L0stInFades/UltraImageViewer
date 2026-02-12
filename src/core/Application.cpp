@@ -1,4 +1,5 @@
 #include "core/Application.hpp"
+#include "core/SimdUtils.hpp"
 
 #include <ShellScalingApi.h>
 #include <shlwapi.h>
@@ -63,6 +64,7 @@ Application::~Application()
 bool Application::Initialize(HINSTANCE hInstance)
 {
     hInstance_ = hInstance;
+    Simd::DetectFeatures();
     DebugLog("=== Shiguang starting ===");
 
     if (!InitializeWindow()) {
@@ -287,7 +289,7 @@ void Application::StartFullScan()
             auto canonical = std::filesystem::canonical(f, ec);
             if (ec) canonical = f;  // fallback if canonical fails
             std::wstring key = canonical.wstring();
-            std::transform(key.begin(), key.end(), key.begin(), ::towlower);
+            Simd::ToLowerInPlace(key);
             if (!seen.contains(key)) {
                 seen.insert(key);
                 unique.push_back(std::move(f));
@@ -302,14 +304,14 @@ void Application::StartFullScan()
         std::unordered_map<std::wstring, uint32_t> visitMap;
         for (const auto& fp : folderProfiles_) {
             std::wstring key = fp.folder.wstring();
-            std::transform(key.begin(), key.end(), key.begin(), ::towlower);
+            Simd::ToLowerInPlace(key);
             visitMap[key] = fp.visitCount;
         }
         std::stable_sort(folders.begin(), folders.end(),
             [&visitMap](const std::filesystem::path& a, const std::filesystem::path& b) {
                 std::wstring ka = a.wstring(), kb = b.wstring();
-                std::transform(ka.begin(), ka.end(), ka.begin(), ::towlower);
-                std::transform(kb.begin(), kb.end(), kb.begin(), ::towlower);
+                Simd::ToLowerInPlace(ka);
+                Simd::ToLowerInPlace(kb);
                 uint32_t va = 0, vb = 0;
                 auto ia = visitMap.find(ka); if (ia != visitMap.end()) va = ia->second;
                 auto ib = visitMap.find(kb); if (ib != visitMap.end()) vb = ib->second;
@@ -1150,7 +1152,7 @@ void Application::RemoveAlbumFolder(const std::filesystem::path& albumPath)
 
     // --- 2. In-memory surgery: erase images whose parent == albumPath ---
     std::wstring albumLower = albumPath.wstring();
-    std::transform(albumLower.begin(), albumLower.end(), albumLower.begin(), ::towlower);
+    Simd::ToLowerInPlace(albumLower);
 
     std::vector<ScannedImage> results;
     {
@@ -1159,7 +1161,7 @@ void Application::RemoveAlbumFolder(const std::filesystem::path& albumPath)
             std::remove_if(scannedResults_.begin(), scannedResults_.end(),
                 [&albumLower](const ScannedImage& img) {
                     std::wstring p = img.path.parent_path().wstring();
-                    std::transform(p.begin(), p.end(), p.begin(), ::towlower);
+                    Simd::ToLowerInPlace(p);
                     return p == albumLower;
                 }),
             scannedResults_.end());
@@ -1239,7 +1241,7 @@ void Application::FilterHiddenAlbums(std::vector<ScannedImage>& images) const
     hidden.reserve(hiddenAlbumPaths_.size());
     for (const auto& p : hiddenAlbumPaths_) {
         std::wstring low = p.wstring();
-        std::transform(low.begin(), low.end(), low.begin(), ::towlower);
+        Simd::ToLowerInPlace(low);
         hidden.insert(std::move(low));
     }
 
@@ -1248,7 +1250,7 @@ void Application::FilterHiddenAlbums(std::vector<ScannedImage>& images) const
         std::remove_if(images.begin(), images.end(),
             [&hidden](const ScannedImage& img) {
                 std::wstring parent = img.path.parent_path().wstring();
-                std::transform(parent.begin(), parent.end(), parent.begin(), ::towlower);
+                Simd::ToLowerInPlace(parent);
                 return hidden.contains(parent);
             }),
         images.end());

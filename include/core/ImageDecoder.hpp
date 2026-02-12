@@ -36,7 +36,6 @@ enum class DecoderFlags {
     None = 0,
     ZeroCopy = 1 << 0,
     MemoryMapped = 1 << 1,
-    SIMD = 1 << 2,
     Cacheable = 1 << 3,
     BackgroundLoad = 1 << 4
 };
@@ -50,7 +49,7 @@ inline bool HasFlag(DecoderFlags flags, DecoderFlags flag) {
 }
 
 /**
- * Zero-copy image decoder with SIMD optimization
+ * Zero-copy image decoder
  * Supports JPEG, PNG, TIFF, BMP, GIF, WebP, and RAW formats
  */
 class ImageDecoder {
@@ -61,14 +60,14 @@ public:
     // Main decoding interface
     std::unique_ptr<DecodedImage> Decode(
         const std::filesystem::path& filePath,
-        DecoderFlags flags = DecoderFlags::ZeroCopy | DecoderFlags::SIMD
+        DecoderFlags flags = DecoderFlags::ZeroCopy
     );
 
     // Async decoding
     void DecodeAsync(
         const std::filesystem::path& filePath,
         std::function<void(std::unique_ptr<DecodedImage>)> callback,
-        DecoderFlags flags = DecoderFlags::ZeroCopy | DecoderFlags::SIMD | DecoderFlags::BackgroundLoad
+        DecoderFlags flags = DecoderFlags::ZeroCopy | DecoderFlags::BackgroundLoad
     );
 
     // Image info without full decoding
@@ -97,24 +96,13 @@ private:
         DecoderFlags flags
     );
 
-    // SIMD-optimized format conversion
-    void ConvertFormat_SIMD(uint8_t* dest, const uint8_t* src, size_t pixelCount);
-    void ConvertFormat_SSE42(uint8_t* dest, const uint8_t* src, size_t pixelCount);
-    void ConvertFormat_Fallback(uint8_t* dest, const uint8_t* src, size_t pixelCount);
-
     // Memory-mapped file support
     std::unique_ptr<DecodedImage> DecodeMemoryMapped(
         const std::filesystem::path& filePath,
         DecoderFlags flags
     );
 
-    // Detect CPU capabilities
-    void DetectCPUFeatures();
-
     Microsoft::WRL::ComPtr<IWICImagingFactory2> wicFactory_;
-    bool hasAVX2_ = false;
-    bool hasSSE42_ = false;
-    bool hasAVX512_ = false;
 };
 
 } // namespace Core
