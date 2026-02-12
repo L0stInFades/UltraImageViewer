@@ -200,7 +200,7 @@ void Direct2DRenderer::Shutdown()
 
 void Direct2DRenderer::BeginDraw()
 {
-    if (!context_) {
+    if (!context_ || deviceLost_) {
         return;
     }
 
@@ -214,11 +214,17 @@ void Direct2DRenderer::BeginDraw()
 
 void Direct2DRenderer::EndDraw()
 {
-    if (!context_) {
+    if (!context_ || deviceLost_) {
         return;
     }
 
     HRESULT hr = context_->EndDraw();
+
+    if (hr == D2DERR_RECREATE_TARGET || hr == static_cast<HRESULT>(DXGI_ERROR_DEVICE_REMOVED)) {
+        D2DLog("Device lost detected in EndDraw — recovering");
+        HandleDeviceLost();
+        return;
+    }
 
     if (SUCCEEDED(hr) && swapChain_) {
         // Present
@@ -228,12 +234,34 @@ void Direct2DRenderer::EndDraw()
         params.pScrollRect = nullptr;
         params.pScrollOffset = nullptr;
 
-        swapChain_->Present1(1, 0, &params);
+        HRESULT presentHr = swapChain_->Present1(1, 0, &params);
+        if (presentHr == DXGI_ERROR_DEVICE_REMOVED || presentHr == DXGI_ERROR_DEVICE_RESET) {
+            D2DLog("Device lost detected in Present — recovering");
+            HandleDeviceLost();
+            return;
+        }
 
         // Commit composition
         if (dcompDevice_) {
             dcompDevice_->Commit();
         }
+    }
+}
+
+void Direct2DRenderer::HandleDeviceLost()
+{
+    D2DLog("HandleDeviceLost: releasing all resources");
+    deviceLost_ = true;
+
+    // Release everything in reverse order
+    Shutdown();
+
+    // Attempt to reinitialize
+    if (hwnd_ && Initialize(hwnd_)) {
+        D2DLog("HandleDeviceLost: recovery successful");
+        deviceLost_ = false;
+    } else {
+        D2DLog("HandleDeviceLost: recovery FAILED — device remains lost");
     }
 }
 
@@ -310,69 +338,6 @@ void Direct2DRenderer::DrawImageWithTransform(
     // Reset transform
     D2D1_MATRIX_3X2_F identity = D2D1::Matrix3x2F::Identity();
     context_->SetTransform(identity);
-}
-
-void Direct2DRenderer::ApplyBlurEffect(ID2D1Image* input, float blurAmount)
-{
-    if (!context_ || !input) {
-        return;
-    }
-
-    ComPtr<ID2D1Effect> blurEffect;
-    HRESULT hr = context_->CreateEffect(CLSID_D2D1GaussianBlur, &blurEffect);
-
-    if (SUCCEEDED(hr)) {
-        blurEffect->SetInput(0, input);
-        blurEffect->SetValue(D2D1_GAUSSIANBLUR_PROP_STANDARD_DEVIATION, blurAmount);
-    }
-}
-
-void Direct2DRenderer::ApplySharpenEffect(ID2D1Image* input, float sharpenAmount)
-{
-    if (!context_ || !input) {
-        return;
-    }
-
-    ComPtr<ID2D1Effect> sharpenEffect;
-    HRESULT hr = context_->CreateEffect(CLSID_D2D1Sharpen, &sharpenEffect);
-
-    if (SUCCEEDED(hr)) {
-        sharpenEffect->SetInput(0, input);
-        sharpenEffect->SetValue(D2D1_SHARPEN_PROP_SHARPNESS, sharpenAmount);
-        sharpenEffect->SetValue(D2D1_SHARPEN_PROP_THRESHOLD, 0.5f);
-    }
-}
-
-void Direct2DRenderer::ApplyColorMatrixEffect(
-    ID2D1Image* input,
-    const D2D1_MATRIX_5X4_F& matrix)
-{
-    if (!context_ || !input) {
-        return;
-    }
-
-    ComPtr<ID2D1Effect> colorMatrixEffect;
-    HRESULT hr = context_->CreateEffect(CLSID_D2D1ColorMatrix, &colorMatrixEffect);
-
-    if (SUCCEEDED(hr)) {
-        colorMatrixEffect->SetInput(0, input);
-        colorMatrixEffect->SetValue(D2D1_COLORMATRIX_PROP_COLOR_MATRIX, matrix);
-    }
-}
-
-void Direct2DRenderer::ApplyOpacityEffect(ID2D1Image* input, float opacity)
-{
-    if (!context_ || !input) {
-        return;
-    }
-
-    ComPtr<ID2D1Effect> opacityEffect;
-    HRESULT hr = context_->CreateEffect(CLSID_D2D1Opacity, &opacityEffect);
-
-    if (SUCCEEDED(hr)) {
-        opacityEffect->SetInput(0, input);
-        opacityEffect->SetValue(D2D1_OPACITY_PROP_OPACITY, opacity);
-    }
 }
 
 ComPtr<ID2D1Bitmap> Direct2DRenderer::CreateBitmap(
@@ -570,7 +535,7 @@ void Direct2DRenderer::UpdateComposition()
 
 void Direct2DRenderer::Resize(uint32_t width, uint32_t height)
 {
-    if (width == 0 || height == 0) {
+    if (width == 0 || height == 0 || deviceLost_) {
         return;
     }
 
@@ -594,6 +559,11 @@ void Direct2DRenderer::Resize(uint32_t width, uint32_t height)
             0
         );
 
+        if (hr == DXGI_ERROR_DEVICE_REMOVED || hr == DXGI_ERROR_DEVICE_RESET) {
+            HandleDeviceLost();
+            return;
+        }
+
         if (SUCCEEDED(hr)) {
             // Recreate render target from new back buffer
             ComPtr<IDXGISurface> surface;
@@ -606,11 +576,14 @@ void Direct2DRenderer::Resize(uint32_t width, uint32_t height)
             props.dpiY = dpiY_;
             props.bitmapOptions = D2D1_BITMAP_OPTIONS_TARGET | D2D1_BITMAP_OPTIONS_CANNOT_DRAW;
 
-            context_->CreateBitmapFromDxgiSurface(
+            HRESULT bmpHr = context_->CreateBitmapFromDxgiSurface(
                 surface.Get(),
                 &props,
                 &renderTarget_
             );
+            if (FAILED(bmpHr)) {
+                D2DLogHR("FAIL: CreateBitmapFromDxgiSurface in Resize", bmpHr);
+            }
         }
     }
 

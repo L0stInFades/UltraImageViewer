@@ -111,6 +111,9 @@ private:
     void ThumbnailDecodeTask(const std::filesystem::path& path,
                              uint32_t targetSize, uint64_t generation);
 
+    // LRU eviction for full-size image cache
+    void EvictFullImagesIfNeeded();
+
     // LRU eviction for thumbnail cache (demotes to Tier 2 compressed cache)
     void EvictThumbnailsIfNeeded();
 
@@ -155,6 +158,8 @@ private:
     size_t thumbnailCacheBytes_ = 0;
 
     std::unordered_map<std::filesystem::path, Microsoft::WRL::ComPtr<ID2D1Bitmap>> fullImageCache_;
+    size_t fullImageCacheBytes_ = 0;
+    static constexpr size_t kFullImageCacheMax = 256ULL * 1024 * 1024;  // ~3 x 20MP images
     mutable std::mutex cacheMutex_;
 
     // --- Async thumbnail pipeline ---

@@ -1705,9 +1705,10 @@ void GalleryView::Update(float deltaTime)
         scanBarPhase_ = 0.0f;
     }
 
-    // Edit mode time accumulator
+    // Edit mode time accumulator (fmod keeps in [0, period) to prevent float precision loss)
     if (editMode_ || !editBadgeScale_.IsFinished()) {
         editModeTime_ += deltaTime;
+        editModeTime_ = std::fmod(editModeTime_, 1.0f / Theme::JiggleFrequencyHz);
     }
 
     // Delete card shrink completion
@@ -1738,7 +1739,7 @@ void GalleryView::Update(float deltaTime)
             rawVelocity = std::abs(albumsScrollY_.GetVelocity());
         }
 
-        scrollVelocitySmoothed_ = scrollVelocitySmoothed_ * 0.8f + rawVelocity * 0.2f;
+        scrollVelocitySmoothed_ = scrollVelocitySmoothed_ * 0.6f + rawVelocity * 0.4f;
         bool wasFastScrolling = isFastScrolling_;
         isFastScrolling_ = scrollVelocitySmoothed_ > Theme::FastScrollThreshold;
 

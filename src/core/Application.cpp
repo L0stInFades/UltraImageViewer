@@ -438,6 +438,8 @@ bool Application::InitializeWindow()
     wcex.hInstance = hInstance_;
     wcex.hCursor = LoadCursor(nullptr, IDC_ARROW);
     wcex.hbrBackground = nullptr;  // No GDI background - D2D handles everything
+    wcex.hIcon = LoadIconW(hInstance_, L"IDI_APPICON");
+    wcex.hIconSm = LoadIconW(hInstance_, L"IDI_APPICON");
     wcex.lpszClassName = L"UltraImageViewerWindowClass";
 
     if (!RegisterClassExW(&wcex)) {

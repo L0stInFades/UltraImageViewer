@@ -53,6 +53,7 @@ void ImagePipeline::Shutdown()
     tier2Cache_.clear();
     tier2Bytes_ = 0;
     fullImageCache_.clear();
+    fullImageCacheBytes_ = 0;
     pendingRequests_.clear();
 }
 
@@ -68,8 +69,13 @@ Microsoft::WRL::ComPtr<ID2D1Bitmap> ImagePipeline::GetBitmap(const std::filesyst
 
     auto bitmap = DecodeAndCreateBitmap(path);
     if (bitmap) {
+        auto sz = bitmap->GetPixelSize();
+        size_t bytes = static_cast<size_t>(sz.width) * sz.height * 4;
+
         std::lock_guard lock(cacheMutex_);
         fullImageCache_[path] = bitmap;
+        fullImageCacheBytes_ += bytes;
+        EvictFullImagesIfNeeded();
     }
     return bitmap;
 }
@@ -92,8 +98,13 @@ void ImagePipeline::GetBitmapAsync(const std::filesystem::path& path, BitmapCall
     threadPool_->Submit([this, pathCopy, cb = std::move(callback)] {
         auto bitmap = DecodeAndCreateBitmap(pathCopy);
         if (bitmap) {
+            auto sz = bitmap->GetPixelSize();
+            size_t bytes = static_cast<size_t>(sz.width) * sz.height * 4;
+
             std::lock_guard lock(cacheMutex_);
             fullImageCache_[pathCopy] = bitmap;
+            fullImageCacheBytes_ += bytes;
+            EvictFullImagesIfNeeded();
         }
         if (cb) cb(bitmap);
     }, TaskPriority::Normal);
@@ -650,12 +661,19 @@ void ImagePipeline::ThumbnailDecodeTask(const std::filesystem::path& path,
                                          uint32_t targetSize, uint64_t generation)
 {
     // Check generation — skip stale requests
-    if (generation < generation_.load()) return;
+    if (generation < generation_.load()) {
+        std::lock_guard lock(cacheMutex_);
+        pendingRequests_.erase(path);
+        return;
+    }
 
     // Check if already cached (another worker may have finished it)
     {
         std::lock_guard lock(cacheMutex_);
-        if (thumbnailCache_.contains(path)) return;
+        if (thumbnailCache_.contains(path)) {
+            pendingRequests_.erase(path);
+            return;
+        }
     }
 
     // RAII guard for THREAD_MODE_BACKGROUND_BEGIN/END pairing.
@@ -719,13 +737,21 @@ void ImagePipeline::ThumbnailDecodeTask(const std::filesystem::path& path,
 
     // Fall back to JPEG decode if not in persistent cache
     if (!pixels) {
-        if (!decoder_) return;
+        if (!decoder_) {
+            std::lock_guard lock(cacheMutex_);
+            pendingRequests_.erase(path);
+            return;
+        }
 
         auto image = decoder_->GenerateThumbnail(path, targetSize);
         if (!image || !image->data) {
             image = decoder_->Decode(path, DecoderFlags::ZeroCopy);
         }
-        if (!image || !image->data) return;
+        if (!image || !image->data) {
+            std::lock_guard lock(cacheMutex_);
+            pendingRequests_.erase(path);
+            return;
+        }
 
         pixels = std::move(image->data);
         imgWidth = image->info.width;
@@ -733,7 +759,11 @@ void ImagePipeline::ThumbnailDecodeTask(const std::filesystem::path& path,
     }
 
     // Check generation again after decode
-    if (generation < generation_.load()) return;
+    if (generation < generation_.load()) {
+        std::lock_guard lock(cacheMutex_);
+        pendingRequests_.erase(path);
+        return;
+    }
 
     // Push to ready queue for render thread to create D2D bitmap
     ReadyThumbnail ready;
@@ -787,6 +817,23 @@ bool ImagePipeline::DecompressPixels(const uint8_t* src, size_t srcSize,
     SIZE_T decompressedSize = 0;
     BOOL ok = Decompress(dg.h, src, srcSize, dst, dstSize, &decompressedSize);
     return ok && decompressedSize == dstSize;
+}
+
+void ImagePipeline::EvictFullImagesIfNeeded()
+{
+    // Called with cacheMutex_ held. Evict oldest entries to stay under budget.
+    while (fullImageCacheBytes_ > kFullImageCacheMax && fullImageCache_.size() > 1) {
+        // Find the first entry (unordered_map iteration = arbitrary = oldest-ish)
+        auto oldest = fullImageCache_.begin();
+        auto sz = oldest->second->GetPixelSize();
+        size_t bytes = static_cast<size_t>(sz.width) * sz.height * 4;
+        if (fullImageCacheBytes_ >= bytes) {
+            fullImageCacheBytes_ -= bytes;
+        } else {
+            fullImageCacheBytes_ = 0;
+        }
+        fullImageCache_.erase(oldest);
+    }
 }
 
 void ImagePipeline::EvictThumbnailsIfNeeded()

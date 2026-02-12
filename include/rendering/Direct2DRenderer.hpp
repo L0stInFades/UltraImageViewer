@@ -50,12 +50,6 @@ public:
         const D2D1_RECT_F* srcRect = nullptr
     );
 
-    // Effects
-    void ApplyBlurEffect(ID2D1Image* input, float blurAmount);
-    void ApplySharpenEffect(ID2D1Image* input, float sharpenAmount);
-    void ApplyColorMatrixEffect(ID2D1Image* input, const D2D1_MATRIX_5X4_F& matrix);
-    void ApplyOpacityEffect(ID2D1Image* input, float opacity);
-
     // Bitmap creation
     ComPtr<ID2D1Bitmap> CreateBitmap(
         uint32_t width,
@@ -77,6 +71,8 @@ public:
 
     // Device management
     void Resize(uint32_t width, uint32_t height);
+    bool IsDeviceLost() const { return deviceLost_; }
+    void HandleDeviceLost();
     ID2D1DeviceContext* GetContext() const { return context_.Get(); }
     ID2D1Factory3* GetFactory() const { return factory_.Get(); }
 
@@ -119,6 +115,9 @@ private:
 
     // Render target
     ComPtr<ID2D1Bitmap1> renderTarget_;
+
+    // Device lost recovery
+    bool deviceLost_ = false;
 };
 
 /**
